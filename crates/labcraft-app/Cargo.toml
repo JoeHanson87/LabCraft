@@ -1,0 +1,12 @@
+[package]
+name = "labcraft-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "labcraft"
+path = "src/main.rs"
+
+[dependencies]
+labcraft-core = { path = "../labcraft-core" }
+eframe = "0.37"
