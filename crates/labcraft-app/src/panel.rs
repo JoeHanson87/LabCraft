@@ -23,7 +23,7 @@ pub fn show(app: &mut LabCraft, ui: &mut egui::Ui) {
         let sel = app.selected == Some(n.id);
 
         let grab = Rect::from_min_size(r.min, Vec2::new(r.width(), 20.0));
-        let g = ui.interact(grab, ui.id().with(("grab", n.id)), Sense::click_and_drag());
+        let g = ui.interact(grab, ui.scope_id().with(("grab", n.id)), Sense::click_and_drag());
         if g.clicked() || g.drag_started() {
             app.selected = Some(n.id);
         }

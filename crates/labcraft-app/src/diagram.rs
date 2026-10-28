@@ -62,7 +62,7 @@ pub fn show(app: &mut LabCraft, ui: &mut egui::Ui) {
     for n in &nodes {
         let r = Rect::from_min_size(origin + Vec2::new(n.pos[0], n.pos[1]), size(n));
         let sel = app.selected == Some(n.id);
-        let body = ui.interact(r, ui.id().with(("node", n.id)), Sense::click_and_drag());
+        let body = ui.interact(r, ui.scope_id().with(("node", n.id)), Sense::click_and_drag());
         if body.clicked() || body.drag_started() {
             app.selected = Some(n.id);
         }
@@ -85,7 +85,7 @@ pub fn show(app: &mut LabCraft, ui: &mut egui::Ui) {
                 painter.circle_stroke(p, TERM_R + 3.0, Stroke::new(1.5, theme::ACCENT));
             }
             painter.text(p + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, t.name, FontId::proportional(10.0), theme::TEXT_DIM);
-            let tr = ui.interact(Rect::from_center_size(p, Vec2::splat(14.0)), ui.id().with(("in", n.id, i)), Sense::click());
+            let tr = ui.interact(Rect::from_center_size(p, Vec2::splat(14.0)), ui.scope_id().with(("in", n.id, i)), Sense::click());
             if tr.secondary_clicked() {
                 app.pending.push(Command::Disconnect { to: (n.id, i) });
             }
@@ -94,7 +94,7 @@ pub fn show(app: &mut LabCraft, ui: &mut egui::Ui) {
             let p = term_pos(origin, n, i, true);
             painter.circle_filled(p, TERM_R, theme::type_color(t.ty));
             painter.text(p - Vec2::new(8.0, 0.0), Align2::RIGHT_CENTER, t.name, FontId::proportional(10.0), theme::TEXT_DIM);
-            let tr = ui.interact(Rect::from_center_size(p, Vec2::splat(14.0)), ui.id().with(("out", n.id, i)), Sense::drag());
+            let tr = ui.interact(Rect::from_center_size(p, Vec2::splat(14.0)), ui.scope_id().with(("out", n.id, i)), Sense::drag());
             if tr.drag_started() {
                 app.wiring = Some((n.id, i));
             }

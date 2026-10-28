@@ -161,7 +161,7 @@ impl eframe::App for LabCraft {
             let _ = self.ed.redo();
         }
 
-        egui::Panel::top("toolbar").show_inside(ui, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("LabCRAFT").strong().color(theme::ACCENT));
                 ui.separator();
@@ -203,7 +203,7 @@ impl eframe::App for LabCraft {
             });
         });
 
-        egui::Panel::bottom("status").show_inside(ui, |ui| {
+        egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&self.ed.vi.name).color(theme::TEXT_DIM));
                 ui.separator();
@@ -211,9 +211,9 @@ impl eframe::App for LabCraft {
             });
         });
 
-        egui::Panel::left("palette").default_size(170.0).show_inside(ui, |ui| self.palette(ui));
+        egui::Panel::left("palette").default_size(170.0).show(ui, |ui| self.palette(ui));
 
-        egui::CentralPanel::default().show_inside(ui, |ui| match self.view {
+        egui::CentralPanel::default().show(ui, |ui| match self.view {
             View::FrontPanel => panel::show(self, ui),
             View::BlockDiagram => diagram::show(self, ui),
         });
