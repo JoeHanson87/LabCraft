@@ -16,10 +16,11 @@ impl TypeMap {
     pub fn outs(&self, id: NodeId) -> &[DataType] {
         self.outs.get(&id).map(|v| v.as_slice()).unwrap_or(&[])
     }
-    /// Type arriving at an input terminal (the wire's source type), if wired.
-    pub fn input(&self, vi: &Vi, id: NodeId, idx: usize) -> Option<&DataType> {
+    /// Type arriving at an input terminal (the wire's source type, after any auto-indexing), if wired.
+    pub fn input(&self, vi: &Vi, id: NodeId, idx: usize) -> Option<DataType> {
         let w = vi.wires.iter().find(|w| w.to == (id, idx))?;
-        self.out(w.from.0, w.from.1)
+        let src = self.out(w.from.0, w.from.1)?;
+        Some(wire_type(vi, w.from.0, w.to.0, w.auto_index, src))
     }
 }
 
@@ -53,12 +54,14 @@ impl Resolver<'_> {
         }
         let outs = match &node.kind {
             NodeKind::Control { .. } | NodeKind::Constant(_) | NodeKind::Loop { .. } | NodeKind::Indicator { .. } => declared,
+            NodeKind::Case { .. } | NodeKind::Event { .. } | NodeKind::Sequence { .. } | NodeKind::Feedback { .. } | NodeKind::Local { .. } | NodeKind::Global { .. } => declared,
             kind => {
                 let n_in = kind.inputs().len();
                 let ins: Vec<Option<DataType>> = (0..n_in)
                     .map(|i| {
                         let w = self.vi.wires.iter().find(|w| w.to == (id, i)).copied()?;
-                        self.node_outs(w.from.0).get(w.from.1).cloned()
+                        let src = self.node_outs(w.from.0).get(w.from.1).cloned()?;
+                        Some(wire_type(self.vi, w.from.0, w.to.0, w.auto_index, &src))
                     })
                     .collect();
                 result_types(kind, &ins)
@@ -232,19 +235,67 @@ pub fn result_types(kind: &NodeKind, ins: &[Option<DataType>]) -> Vec<DataType> 
     }
 }
 
+/// Loops a wire leaves (innermost first) and enters (outermost first) between two nodes.
+pub fn crossing_loops(vi: &Vi, from: NodeId, to: NodeId) -> (Vec<NodeId>, Vec<NodeId>) {
+    let (fa, ta) = (vi.ancestors(from), vi.ancestors(to));
+    let is_loop = |id: &NodeId| vi.node(*id).is_some_and(|n| n.kind.is_loop());
+    let leaving = fa.iter().filter(|s| **s != to && !ta.contains(s) && is_loop(s)).copied().collect();
+    let mut entering: Vec<NodeId> = ta.iter().filter(|s| **s != from && !fa.contains(s) && is_loop(s)).copied().collect();
+    entering.reverse();
+    (leaving, entering)
+}
+
+/// The type seen by the destination terminal: arrays gain a dimension per auto-indexed loop
+/// the wire leaves, and lose one per auto-indexed loop it enters.
+pub fn wire_type(vi: &Vi, from: NodeId, to: NodeId, auto_index: bool, src: &DataType) -> DataType {
+    if !auto_index {
+        return src.clone();
+    }
+    let (leaving, entering) = crossing_loops(vi, from, to);
+    let mut t = src.clone();
+    for _ in leaving {
+        t = match t {
+            DataType::Array(e, m) => DataType::Array(e, m + 1),
+            s => DataType::array(s, 1),
+        };
+    }
+    for _ in entering {
+        t = match t {
+            DataType::Array(e, 1) => *e,
+            DataType::Array(e, m) => DataType::Array(e, m - 1),
+            s => s,
+        };
+    }
+    t
+}
+
+/// Auto-indexing is on by default for For loops (when the data is an array on the way in).
+pub fn default_auto_index(vi: &Vi, from: NodeId, to: NodeId, src: &DataType) -> bool {
+    let (leaving, entering) = crossing_loops(vi, from, to);
+    if leaving.is_empty() && entering.is_empty() {
+        return false;
+    }
+    let is_for = |id: &NodeId| matches!(vi.node(*id).map(|n| &n.kind), Some(NodeKind::Loop { kind: crate::model::LoopKind::For, .. }));
+    if !leaving.iter().chain(entering.iter()).all(is_for) {
+        return false;
+    }
+    entering.is_empty() || matches!(src, DataType::Array(_, n) if *n >= entering.len())
+}
+
 fn mismatch(a: &DataType, b: &DataType) -> EditError {
     EditError::TypeMismatch(a.clone(), b.clone())
 }
 
 /// Validate wiring `from` -> `to` against the current diagram.
-pub fn check_connect(vi: &Vi, from: (NodeId, usize), to: (NodeId, usize)) -> Result<(), EditError> {
+pub fn check_connect(vi: &Vi, from: (NodeId, usize), to: (NodeId, usize), auto_index: bool) -> Result<(), EditError> {
     let tm = resolve(vi);
-    let src = tm.out(from.0, from.1).cloned().ok_or(EditError::NoTerminal(from.0, from.1))?;
+    let raw = tm.out(from.0, from.1).cloned().ok_or(EditError::NoTerminal(from.0, from.1))?;
+    let src = wire_type(vi, from.0, to.0, auto_index, &raw);
     let dst = vi.node(to.0).ok_or(EditError::NoNode(to.0))?;
     let terms = dst.kind.inputs();
     let term = terms.get(to.1).ok_or(EditError::NoTerminal(to.0, to.1))?;
     // The other operand of a binary node, if it is wired from somewhere other than this wire.
-    let other = |idx: usize| -> Option<DataType> { tm.input(vi, to.0, idx).cloned() };
+    let other = |idx: usize| -> Option<DataType> { tm.input(vi, to.0, idx) };
     match term.spec {
         Spec::Exact => {
             if !src.can_feed(&term.ty) {
@@ -301,6 +352,11 @@ pub fn check_connect(vi: &Vi, from: (NodeId, usize), to: (NodeId, usize)) -> Res
                     }
                 }
             }
+            NodeKind::Case { .. } => {
+                if to.1 == 0 && !matches!(src, DataType::Bool | DataType::Num(_) | DataType::Str | DataType::Enum(_)) {
+                    return Err(mismatch(&src, &DataType::I32));
+                }
+            }
             NodeKind::BuildArray => {
                 if let Some(DataType::Array(e, n)) = other(0) {
                     let ok = if n == 1 { src.can_feed(&e) } else { src.can_feed(&DataType::Array(e.clone(), n - 1)) };
@@ -348,7 +404,9 @@ pub fn coercion_dots(vi: &Vi, tm: &TypeMap) -> HashSet<(NodeId, usize)> {
     let mut dots = HashSet::new();
     for w in &vi.wires {
         let Some(node) = vi.node(w.to.0) else { continue };
-        let Some(src) = tm.out(w.from.0, w.from.1) else { continue };
+        let Some(raw) = tm.out(w.from.0, w.from.1) else { continue };
+        let src_owned = wire_type(vi, w.from.0, w.to.0, w.auto_index, raw);
+        let src = &src_owned;
         let terms = node.kind.inputs();
         let Some(term) = terms.get(w.to.1) else { continue };
         let expected: Option<NumKind> = match term.spec {
@@ -358,7 +416,7 @@ pub fn coercion_dots(vi: &Vi, tm: &TypeMap) -> HashSet<(NodeId, usize)> {
                 NodeKind::Greater | NodeKind::Less | NodeKind::GreaterEq | NodeKind::LessEq => {
                     let (a, b) = (tm.input(vi, w.to.0, 0), tm.input(vi, w.to.0, 1));
                     match (a, b) {
-                        (Some(a), Some(b)) => join_num(a, b).and_then(|t| num_kind_of(&t)),
+                        (Some(a), Some(b)) => join_num(&a, &b).and_then(|t| num_kind_of(&t)),
                         _ => None,
                     }
                 }

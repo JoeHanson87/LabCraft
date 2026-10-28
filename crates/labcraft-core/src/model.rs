@@ -7,6 +7,17 @@ pub type NodeId = u64;
 pub const NODE_W: f32 = 120.0;
 /// Loop border thickness used by terminal layout.
 pub const LOOP_BORDER: f32 = 14.0;
+/// Upper bound on frames in a Case/Event structure; per-frame tunnel terminals are laid out in this stride.
+pub const MAX_FRAMES: usize = 16;
+
+/// One frame of an Event structure: a control whose value change triggers it, or the timeout.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EventFrame {
+    pub label: String,
+    /// The control whose Value Change fires this frame; `None` means the Timeout frame.
+    pub source: Option<NodeId>,
+    pub ty: DataType,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopKind {
@@ -183,6 +194,18 @@ pub enum NodeKind {
     MergeErrors,
     /// A While or For loop structure with shift registers of the given types.
     Loop { kind: LoopKind, regs: Vec<DataType> },
+    /// Case structure (or Diagram Disable structure when `fixed` is set). Output tunnels have
+    /// explicit per-frame terminals because only one frame runs.
+    Case { labels: Vec<String>, default: Option<usize>, outs: Vec<DataType>, fixed: Option<usize> },
+    /// Flat sequence: frames run left to right.
+    Sequence { frames: usize },
+    Event { frames: Vec<EventFrame>, outs: Vec<DataType> },
+    /// Holds a value from the previous loop iteration.
+    Feedback { ty: DataType },
+    /// Reads or writes a front-panel control/indicator by reference.
+    Local { target: Option<NodeId>, ty: DataType, write: bool },
+    /// Named variable shared across the whole VI (and across runs).
+    Global { name: String, ty: DataType, write: bool },
 }
 
 /// What types a terminal accepts.
@@ -271,6 +294,14 @@ impl NodeKind {
             NodeKind::UnbundleByName { .. } => "Unbundle By Name".into(),
             NodeKind::ErrorFromCode => "Error From Code".into(),
             NodeKind::MergeErrors => "Merge Errors".into(),
+            NodeKind::Case { fixed: Some(_), .. } => "Diagram Disable Structure".into(),
+            NodeKind::Case { .. } => "Case Structure".into(),
+            NodeKind::Sequence { .. } => "Flat Sequence".into(),
+            NodeKind::Event { .. } => "Event Structure".into(),
+            NodeKind::Feedback { .. } => "Feedback Node".into(),
+            NodeKind::Local { write: true, .. } => "Local Variable (write)".into(),
+            NodeKind::Local { .. } => "Local Variable".into(),
+            NodeKind::Global { name, write, .. } => format!("{name}{}", if *write { " (write)" } else { "" }),
             NodeKind::Loop { kind: LoopKind::While, .. } => "While Loop".into(),
             NodeKind::Loop { kind: LoopKind::For, .. } => "For Loop".into(),
         }
@@ -285,7 +316,7 @@ impl NodeKind {
         let num1 = || vec![t("x", T::DBL).spec(NumLike)];
         match self {
             NodeKind::Control { .. } | NodeKind::Constant(_) | NodeKind::Random => vec![],
-            NodeKind::Indicator { ty, .. } => vec![t("in", ty.clone())],
+            NodeKind::Indicator { ty, .. } => vec![t("in", ty.clone()).opt()],
             NodeKind::Add | NodeKind::Subtract | NodeKind::Multiply | NodeKind::Divide => num2(),
             NodeKind::Greater | NodeKind::Less | NodeKind::GreaterEq | NodeKind::LessEq => num2(),
             NodeKind::Increment | NodeKind::Decrement | NodeKind::Negate | NodeKind::Absolute | NodeKind::SquareRoot | NodeKind::Convert(_) => num1(),
@@ -315,6 +346,30 @@ impl NodeKind {
             NodeKind::UnbundleByName { .. } => vec![t("cluster", T::Cluster(vec![])).spec(AnyCluster)],
             NodeKind::ErrorFromCode => vec![t("code", T::I32), t("source", T::Str).opt()],
             NodeKind::MergeErrors => vec![t("error 1", T::error_cluster()).opt(), t("error 2", T::error_cluster()).opt()],
+            NodeKind::Case { outs, fixed, labels, .. } => {
+                let mut v = vec![t("?", T::DBL).spec(Any).opt()];
+                let _ = fixed;
+                for (k, ty) in outs.iter().enumerate() {
+                    for f in 0..MAX_FRAMES {
+                        let name = format!("tunnel {k}: {}", labels.get(f).map(String::as_str).unwrap_or("-"));
+                        v.push(t(&name, ty.clone()).inner().opt());
+                    }
+                }
+                v
+            }
+            NodeKind::Event { outs, .. } => {
+                let mut v = vec![t("timeout", T::I32).opt()];
+                for (k, ty) in outs.iter().enumerate() {
+                    for _ in 0..MAX_FRAMES {
+                        v.push(t(&format!("tunnel {k}"), ty.clone()).inner().opt());
+                    }
+                }
+                v
+            }
+            NodeKind::Sequence { .. } => vec![],
+            NodeKind::Feedback { ty } => vec![t("in", ty.clone()), t("init", ty.clone()).opt()],
+            NodeKind::Local { ty, write: true, .. } | NodeKind::Global { ty, write: true, .. } => vec![t("in", ty.clone())],
+            NodeKind::Local { .. } | NodeKind::Global { .. } => vec![],
             NodeKind::Loop { kind, regs } => {
                 let mut v = vec![match kind {
                     LoopKind::For => t("N", T::I32),
@@ -353,6 +408,21 @@ impl NodeKind {
             NodeKind::Unbundle { n } => (0..*n).map(|i| t(&format!("{i}"), T::DBL)).collect(),
             NodeKind::UnbundleByName { names } => names.iter().map(|n| t(if n.is_empty() { "?" } else { n }, T::DBL)).collect(),
             NodeKind::ErrorFromCode | NodeKind::MergeErrors => vec![t("error out", T::error_cluster())],
+            NodeKind::Case { outs, .. } => outs.iter().map(|ty| t("out", ty.clone())).collect(),
+            NodeKind::Event { frames, outs } => {
+                let mut v: Vec<Terminal> = (0..MAX_FRAMES)
+                    .map(|f| match frames.get(f) {
+                        Some(fr) if fr.source.is_some() => t("NewVal", fr.ty.clone()).inner(),
+                        _ => t("-", T::Bool).inner(),
+                    })
+                    .collect();
+                v.extend(outs.iter().map(|ty| t("out", ty.clone())));
+                v
+            }
+            NodeKind::Sequence { .. } => vec![],
+            NodeKind::Feedback { ty } => vec![t("out", ty.clone())],
+            NodeKind::Local { ty, write: false, .. } | NodeKind::Global { ty, write: false, .. } => vec![t("value", ty.clone())],
+            NodeKind::Local { .. } | NodeKind::Global { .. } => vec![],
             NodeKind::Loop { regs, .. } => {
                 let mut v = vec![t("i", T::I32).inner()];
                 for ty in regs {
@@ -372,9 +442,73 @@ impl NodeKind {
         matches!(self, NodeKind::Loop { .. })
     }
 
+    /// Loops, Case, Sequence and Event structures contain other nodes.
+    pub fn is_structure(&self) -> bool {
+        matches!(self, NodeKind::Loop { .. } | NodeKind::Case { .. } | NodeKind::Sequence { .. } | NodeKind::Event { .. })
+    }
+
+    /// Structures where only one frame runs (so data leaving needs an explicit tunnel).
+    pub fn is_frame_gated(&self) -> bool {
+        matches!(self, NodeKind::Case { .. } | NodeKind::Event { .. })
+    }
+
+    pub fn frame_count(&self) -> usize {
+        match self {
+            NodeKind::Case { labels, .. } => labels.len(),
+            NodeKind::Sequence { frames } => *frames,
+            NodeKind::Event { frames, .. } => frames.len(),
+            _ => 1,
+        }
+    }
+
+    pub fn tunnel_count(&self) -> usize {
+        match self {
+            NodeKind::Case { outs, .. } | NodeKind::Event { outs, .. } => outs.len(),
+            _ => 0,
+        }
+    }
+
+    /// Index of the inner input terminal for tunnel `k` in `frame`.
+    pub fn tunnel_in_idx(k: usize, frame: usize) -> usize {
+        1 + k * MAX_FRAMES + frame
+    }
+
+    /// Index of the outer output terminal for tunnel `k`.
+    pub fn tunnel_out_idx(&self, k: usize) -> usize {
+        if matches!(self, NodeKind::Event { .. }) { MAX_FRAMES + k } else { k }
+    }
+
+    /// Whether a terminal is currently shown (per-frame terminals only show for the visible frame).
+    pub fn terminal_visible(&self, idx: usize, output: bool, frame_view: usize) -> bool {
+        match self {
+            NodeKind::Case { fixed, labels, .. } => {
+                if output {
+                    true
+                } else if idx == 0 {
+                    fixed.is_none()
+                } else {
+                    let f = (idx - 1) % MAX_FRAMES;
+                    f == frame_view && f < labels.len()
+                }
+            }
+            NodeKind::Event { frames, .. } => {
+                if output {
+                    if idx < MAX_FRAMES { idx == frame_view && idx < frames.len() && frames[idx].source.is_some() } else { true }
+                } else if idx == 0 {
+                    true
+                } else {
+                    (idx - 1) % MAX_FRAMES == frame_view
+                }
+            }
+            _ => true,
+        }
+    }
+
     pub fn default_size(&self) -> [f32; 2] {
-        if self.is_loop() {
-            return [300.0, 200.0];
+        match self {
+            NodeKind::Loop { .. } | NodeKind::Case { .. } | NodeKind::Event { .. } => return [300.0, 200.0],
+            NodeKind::Sequence { frames } => return [60.0 + 200.0 * *frames as f32, 200.0],
+            _ => {}
         }
         let rows = self.inputs().len().max(self.outputs().len()).max(1) as f32;
         let h = match self {
@@ -401,6 +535,12 @@ pub struct Node {
     pub range: [f64; 2],
     /// Enclosing structure, if this node sits inside one.
     pub parent: Option<NodeId>,
+    /// Which frame of the parent structure this node is in.
+    #[serde(default)]
+    pub frame: usize,
+    /// Frame currently displayed (multi-frame structures only).
+    #[serde(default)]
+    pub frame_view: usize,
     /// Current value for controls (user input), indicators (last result) and constants.
     pub value: Option<Value>,
 }
@@ -444,6 +584,29 @@ impl Node {
                 }
             };
         }
+        let b = LOOP_BORDER;
+        match &self.kind {
+            NodeKind::Case { .. } => {
+                return if output {
+                    [x + w, self.loop_reg_y(idx)]
+                } else if idx == 0 {
+                    [x, y + h / 2.0]
+                } else {
+                    [x + w - b, self.loop_reg_y((idx - 1) / MAX_FRAMES)]
+                };
+            }
+            NodeKind::Event { .. } => {
+                return if output {
+                    if idx < MAX_FRAMES { [x + b + 8.0, y + 44.0] } else { [x + w, self.loop_reg_y(idx - MAX_FRAMES)] }
+                } else if idx == 0 {
+                    [x, y + 28.0]
+                } else {
+                    [x + w - b, self.loop_reg_y((idx - 1) / MAX_FRAMES)]
+                };
+            }
+            NodeKind::Sequence { .. } => return [x, y],
+            _ => {}
+        }
         let count = if output { self.kind.outputs().len() } else { self.kind.inputs().len() }.max(1) as f32;
         let ty = 28.0 + (idx as f32 + 0.5) * (h - 28.0) / count;
         [x + if output { w } else { 0.0 }, y + ty]
@@ -454,6 +617,10 @@ impl Node {
 pub struct Wire {
     pub from: (NodeId, usize),
     pub to: (NodeId, usize),
+    /// For wires crossing a loop border: gather per-iteration values into an array (leaving) or
+    /// hand out one element per iteration (entering).
+    #[serde(default)]
+    pub auto_index: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -515,17 +682,98 @@ impl Vi {
         self.nodes.iter().filter(|n| self.is_descendant(n.id, id)).map(|n| n.id).collect()
     }
 
-    /// Innermost loop containing `point`, ignoring `exclude` and everything inside it.
+    /// Structures enclosing `id`, innermost first.
+    pub fn ancestors(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = vec![];
+        let mut cur = self.node(id).and_then(|n| n.parent);
+        while let Some(p) = cur {
+            out.push(p);
+            cur = self.node(p).and_then(|n| n.parent);
+            if out.len() > 1000 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// `(structure, frame)` pairs from the outermost structure down to the one directly holding `id`.
+    pub fn frames_chain(&self, id: NodeId) -> Vec<(NodeId, usize)> {
+        let mut chain = vec![];
+        let mut cur = id;
+        while let Some(n) = self.node(cur) {
+            match n.parent {
+                Some(p) => {
+                    chain.push((p, n.frame));
+                    cur = p;
+                }
+                None => break,
+            }
+            if chain.len() > 1000 {
+                break;
+            }
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Frame of `structure` that contains `point`.
+    pub fn frame_at(&self, structure: NodeId, point: [f32; 2]) -> usize {
+        let Some(st) = self.node(structure) else { return 0 };
+        let count = st.kind.frame_count().max(1);
+        match &st.kind {
+            NodeKind::Sequence { frames } => {
+                let fw = st.size[0] / *frames as f32;
+                (((point[0] - st.pos[0]) / fw).floor().max(0.0) as usize).min(frames - 1)
+            }
+            NodeKind::Case { .. } | NodeKind::Event { .. } => st.frame_view.min(count - 1),
+            _ => 0,
+        }
+    }
+
+    /// False when the node lives in a frame of a Case/Event structure that is not displayed.
+    pub fn node_visible(&self, id: NodeId) -> bool {
+        self.frames_chain(id).iter().all(|(p, f)| match self.node(*p) {
+            Some(st) if st.kind.is_frame_gated() => st.frame_view.min(st.kind.frame_count().max(1) - 1) == *f,
+            _ => true,
+        })
+    }
+
+    /// Innermost structure containing `point`, ignoring `exclude` and everything inside it.
     pub fn container_at(&self, point: [f32; 2], exclude: Option<NodeId>) -> Option<NodeId> {
         self.nodes
             .iter()
-            .filter(|n| n.kind.is_loop())
+            .filter(|n| n.kind.is_structure())
             .filter(|n| Some(n.id) != exclude && !exclude.is_some_and(|e| self.is_descendant(n.id, e)))
+            .filter(|n| self.node_visible(n.id))
             .filter(|n| {
                 point[0] >= n.pos[0] && point[0] <= n.pos[0] + n.size[0] && point[1] >= n.pos[1] && point[1] <= n.pos[1] + n.size[1]
             })
-            .min_by(|a, b| (a.size[0] * a.size[1]).total_cmp(&(b.size[0] * b.size[1])))
+            .min_by(|a, b| (a.size[0] * a.size[1]).total_cmp(&(b.size[0] * b.size[1])).then(self.depth(b.id).cmp(&self.depth(a.id))))
             .map(|n| n.id)
+    }
+
+    /// Reject wires between nodes in different frames of the same structure, and wires leaving a
+    /// Case/Event frame without a tunnel.
+    pub fn check_frames(&self, from: NodeId, to: NodeId) -> Result<(), EditError> {
+        let (a, b) = (self.frames_chain(from), self.frames_chain(to));
+        for (x, y) in a.iter().zip(b.iter()) {
+            if x.0 != y.0 {
+                break;
+            }
+            if x.1 != y.1 {
+                let kind = &self.node(x.0).ok_or(EditError::NoNode(x.0))?.kind;
+                let ok = matches!(kind, NodeKind::Sequence { .. }) && x.1 < y.1;
+                return if ok { Ok(()) } else { Err(EditError::Scope) };
+            }
+        }
+        let dest_anc = self.ancestors(to);
+        for s in self.ancestors(from) {
+            let gated = self.node(s).is_some_and(|n| n.kind.is_frame_gated());
+            if gated && s != to && !dest_anc.contains(&s) {
+                return Err(EditError::NeedsTunnel(s));
+            }
+        }
+        Ok(())
     }
 
     fn free_panel_spot(&self, size: [f32; 2]) -> [f32; 2] {
@@ -569,6 +817,12 @@ pub enum EditError {
     Cycle,
     #[error("a structure's inner terminal can only feed nodes inside that structure")]
     Scope,
+    #[error("data leaving structure {0} must go through an output tunnel (right-click the border to add one)")]
+    NeedsTunnel(NodeId),
+    #[error("cannot remove the last frame")]
+    LastFrame,
+    #[error("no more frames can be added")]
+    TooManyFrames,
     #[error("node {0} is not a loop")]
     NotALoop(NodeId),
     #[error("loop has no shift registers")]
@@ -601,6 +855,24 @@ pub enum Command {
     SetNames { id: NodeId, names: Vec<String> },
     AddShiftRegister { id: NodeId, ty: DataType },
     RemoveShiftRegister { id: NodeId },
+    /// Switch which frame of a Case/Event structure is displayed (not undoable).
+    SetFrameView { id: NodeId, frame: usize },
+    /// Insert a frame after `after` in a Case or Flat Sequence structure.
+    AddFrame { id: NodeId, after: usize },
+    RemoveFrame { id: NodeId, frame: usize },
+    SetFrameLabel { id: NodeId, frame: usize, label: String },
+    SetDefaultFrame { id: NodeId, frame: Option<usize> },
+    /// Choose which frame of a Diagram Disable structure is enabled.
+    SetEnabledFrame { id: NodeId, frame: usize },
+    /// Add an output tunnel (Case/Event).
+    AddTunnel { id: NodeId, ty: DataType },
+    RemoveTunnel { id: NodeId },
+    /// Add an Event frame for a control's Value Change, or a Timeout frame when `source` is None.
+    AddEventFrame { id: NodeId, source: Option<NodeId> },
+    SetLocalTarget { id: NodeId, target: Option<NodeId> },
+    SetWrite { id: NodeId, write: bool },
+    SetGlobalName { id: NodeId, name: String },
+    SetWireIndexing { to: (NodeId, usize), enabled: bool },
     /// Re-evaluates which structure a node sits in after a drag.
     Drop(NodeId),
     /// Ends a drag gesture so the next move starts a new undo step.
@@ -636,7 +908,7 @@ impl Editor {
             Command::Resize { id, .. } => Some((2, *id)),
             _ => None,
         };
-        let record = !matches!(cmd, Command::SetValue { .. }) && !(key.is_some() && key == self.last_key);
+        let record = !matches!(cmd, Command::SetValue { .. } | Command::SetFrameView { .. }) && !(key.is_some() && key == self.last_key);
         let mut next = self.vi.clone();
         let created = Self::exec(&mut next, cmd)?;
         if record {
@@ -680,14 +952,18 @@ impl Editor {
                 };
                 let size = kind.default_size();
                 let panel_pos = if kind.is_panel_item() { vi.free_panel_spot(widget.panel_size(match &kind { NodeKind::Control { ty, .. } | NodeKind::Indicator { ty, .. } => ty, _ => &DataType::DBL })) } else { [0.0, 0.0] };
-                let parent = if kind.is_loop() { None } else { vi.container_at([pos[0] + size[0] / 2.0, pos[1] + size[1] / 2.0], None) };
-                vi.nodes.push(Node { id, kind, pos, size, panel_pos, widget, range: [0.0, 10.0], parent, value });
+                let center = [pos[0] + size[0] / 2.0, pos[1] + size[1] / 2.0];
+                let parent = if kind.is_structure() { None } else { vi.container_at(center, None) };
+                let frame = parent.map(|p| vi.frame_at(p, center)).unwrap_or(0);
+                vi.nodes.push(Node { id, kind, pos, size, panel_pos, widget, range: [0.0, 10.0], parent, frame, frame_view: 0, value });
                 Ok(Some(id))
             }
             Command::RemoveNode(id) => {
-                let parent = vi.node(id).ok_or(EditError::NoNode(id))?.parent;
+                let removed = vi.node(id).ok_or(EditError::NoNode(id))?;
+                let (parent, slot) = (removed.parent, removed.frame);
                 for n in vi.nodes.iter_mut().filter(|n| n.parent == Some(id)) {
                     n.parent = parent;
+                    n.frame = slot;
                 }
                 vi.nodes.retain(|n| n.id != id);
                 vi.wires.retain(|w| w.from.0 != id && w.to.0 != id);
@@ -711,9 +987,18 @@ impl Editor {
             }
             Command::Resize { id, size } => {
                 let n = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
-                if let NodeKind::Loop { regs, .. } = &n.kind {
-                    let min_h = 110.0 + 30.0 * regs.len() as f32;
-                    n.size = [size[0].max(180.0), size[1].max(min_h)];
+                let rows = match &n.kind {
+                    NodeKind::Loop { regs, .. } => Some(regs.len()),
+                    NodeKind::Case { outs, .. } | NodeKind::Event { outs, .. } => Some(outs.len()),
+                    NodeKind::Sequence { frames } => {
+                        n.size[1] = size[1].max(120.0);
+                        n.size[0] = 60.0 + 200.0 * *frames as f32;
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(r) = rows {
+                    n.size = [size[0].max(220.0), size[1].max(110.0 + 30.0 * r as f32)];
                 }
                 Ok(None)
             }
@@ -722,35 +1007,82 @@ impl Editor {
                 let dst = vi.node(to.0).ok_or(EditError::NoNode(to.0))?;
                 let st = src.kind.outputs().get(from.1).cloned().ok_or(EditError::NoTerminal(from.0, from.1))?;
                 let dt = dst.kind.inputs().get(to.1).cloned().ok_or(EditError::NoTerminal(to.0, to.1))?;
+                let dst_kind = dst.kind.clone();
                 if st.inner && !(vi.is_descendant(to.0, from.0) || (to.0 == from.0 && dt.inner)) {
                     return Err(EditError::Scope);
                 }
-                if !st.inner && !dt.inner && (from.0 == to.0 || reaches(vi, to.0, from.0)) {
+                // A Case/Event tunnel input accepts data only from nodes in the matching frame.
+                if dt.inner && dst_kind.is_frame_gated() && to.1 >= 1 && from.0 != to.0 {
+                    let f = (to.1 - 1) % MAX_FRAMES;
+                    let in_frame = vi.is_descendant(from.0, to.0) && vi.frames_chain(from.0).iter().find(|(p, _)| *p == to.0).map(|x| x.1) == Some(f);
+                    if !in_frame {
+                        return Err(EditError::Scope);
+                    }
+                }
+                vi.check_frames(from.0, to.0)?;
+                // A structure's outer input cannot be fed from inside the structure itself.
+                if !dt.inner && dst_kind.is_structure() && vi.is_descendant(from.0, to.0) {
+                    return Err(EditError::Scope);
+                }
+                let delay = matches!(dst_kind, NodeKind::Feedback { .. }) && to.1 == 0;
+                if !st.inner && !dt.inner && !delay && (from.0 == to.0 || reaches(vi, to.0, from.0)) {
                     return Err(EditError::Cycle);
                 }
+                let raw = typing::out_type(vi, from);
                 // Wiring an untouched shift register's init terminal gives it the source's type.
-                if let (NodeKind::Loop { .. }, true) = (&dst.kind, to.1 >= 1 && to.1 % 2 == 1) {
+                if let (NodeKind::Loop { .. }, true) = (&dst_kind, to.1 >= 1 && to.1 % 2 == 1) {
                     let k = (to.1 - 1) / 2;
                     let untouched = !vi.wires.iter().any(|w| (w.to.0 == to.0 && w.to.1 == to.1 + 1) || (w.from.0 == to.0 && (w.from.1 == to.1 + 1 || w.from.1 == to.1 + 2)));
-                    if untouched {
-                        if let Some(ty) = typing::out_type(vi, from) {
-                            if let NodeKind::Loop { regs, .. } = &mut vi.node_mut(to.0).unwrap().kind {
-                                regs[k] = ty;
-                            }
+                    if let (true, Some(ty)) = (untouched, raw.clone()) {
+                        if let NodeKind::Loop { regs, .. } = &mut vi.node_mut(to.0).unwrap().kind {
+                            regs[k] = ty;
                         }
                     }
                 }
-                typing::check_connect(vi, from, to)?;
-                vi.wires.retain(|w| w.to != to);
-                vi.wires.push(Wire { from, to });
-                // Bundle/Unbundle size themselves to the cluster that is wired in.
-                if to.1 == 0 {
-                    if let Some(DataType::Cluster(fields)) = typing::out_type(vi, from) {
-                        match &mut vi.node_mut(to.0).unwrap().kind {
-                            NodeKind::Unbundle { n } | NodeKind::Bundle { n } => *n = fields.len(),
-                            _ => {}
+                // Likewise for an untouched Case/Event output tunnel.
+                if dt.inner && dst_kind.is_frame_gated() && to.1 >= 1 {
+                    let k = (to.1 - 1) / MAX_FRAMES;
+                    let (base, out_i) = (NodeKind::tunnel_in_idx(k, 0), dst_kind.tunnel_out_idx(k));
+                    let untouched = !vi.wires.iter().any(|w| (w.to.0 == to.0 && w.to.1 >= base && w.to.1 < base + MAX_FRAMES) || (w.from.0 == to.0 && w.from.1 == out_i));
+                    if let (true, Some(ty)) = (untouched, raw.clone()) {
+                        if let NodeKind::Case { outs, .. } | NodeKind::Event { outs, .. } = &mut vi.node_mut(to.0).unwrap().kind {
+                            outs[k] = ty;
                         }
-                        refresh_size(vi, to.0);
+                    }
+                }
+                // Feedback nodes take the type of what is first wired to them.
+                if matches!(dst_kind, NodeKind::Feedback { .. }) {
+                    let untouched = !vi.wires.iter().any(|w| (w.to.0 == to.0) || (w.from.0 == to.0));
+                    if let (true, Some(ty)) = (untouched, raw.clone()) {
+                        vi.node_mut(to.0).unwrap().kind = NodeKind::Feedback { ty };
+                    }
+                }
+                let default_auto = raw.as_ref().map(|t| typing::default_auto_index(vi, from.0, to.0, t)).unwrap_or(false);
+                let (l, e) = typing::crossing_loops(vi, from.0, to.0);
+                let crosses = !l.is_empty() || !e.is_empty();
+                // If the default indexing mode does not type-check, try the other one.
+                let auto = match typing::check_connect(vi, from, to, default_auto) {
+                    Ok(()) => default_auto,
+                    Err(err) if crosses && typing::check_connect(vi, from, to, !default_auto).is_ok() => {
+                        let _ = err;
+                        !default_auto
+                    }
+                    Err(err) => return Err(err),
+                };
+                vi.wires.retain(|w| w.to != to);
+                vi.wires.push(Wire { from, to, auto_index: auto });
+                if to.1 == 0 {
+                    if let Some(ty) = &raw {
+                        // Bundle/Unbundle size themselves to the cluster that is wired in.
+                        if let DataType::Cluster(fields) = ty {
+                            match &mut vi.node_mut(to.0).unwrap().kind {
+                                NodeKind::Unbundle { n } | NodeKind::Bundle { n } => *n = fields.len(),
+                                _ => {}
+                            }
+                            refresh_size(vi, to.0);
+                        }
+                        // A Case selector relabels its frames to match the wired type (when still empty).
+                        sync_case_labels(vi, to.0, ty);
                     }
                 }
                 prune_invalid_wires(vi);
@@ -775,14 +1107,20 @@ impl Editor {
             Command::SetParent { id, parent } => {
                 vi.node(id).ok_or(EditError::NoNode(id))?;
                 if let Some(p) = parent {
-                    if !vi.node(p).ok_or(EditError::NoNode(p))?.kind.is_loop() {
+                    if !vi.node(p).ok_or(EditError::NoNode(p))?.kind.is_structure() {
                         return Err(EditError::NotALoop(p));
                     }
                     if p == id || vi.is_descendant(p, id) {
                         return Err(EditError::Cycle);
                     }
                 }
-                vi.node_mut(id).unwrap().parent = parent;
+                let frame = parent.map(|p| {
+                    let c = vi.node(id).map(|n| [n.pos[0] + n.size[0] / 2.0, n.pos[1] + n.size[1] / 2.0]).unwrap_or([0.0, 0.0]);
+                    vi.frame_at(p, c)
+                });
+                let n = vi.node_mut(id).unwrap();
+                n.parent = parent;
+                n.frame = frame.unwrap_or(0);
                 Ok(None)
             }
             Command::SetType { id, ty } => {
@@ -790,8 +1128,21 @@ impl Editor {
                 let is_ctl = matches!(n.kind, NodeKind::Control { .. });
                 match &mut n.kind {
                     NodeKind::Control { ty: t, .. } | NodeKind::Indicator { ty: t, .. } | NodeKind::Constant(t) => *t = ty.clone(),
+                    NodeKind::Feedback { ty: t } | NodeKind::Global { ty: t, .. } => {
+                        *t = ty.clone();
+                        prune_invalid_wires(vi);
+                        return Ok(None);
+                    }
                     _ => return Err(EditError::WrongNodeKind(id)),
                 }
+                for l in vi.nodes.iter_mut() {
+                    if let NodeKind::Local { target: Some(t), ty: lt, .. } = &mut l.kind {
+                        if *t == id {
+                            *lt = ty.clone();
+                        }
+                    }
+                }
+                let n = vi.node_mut(id).unwrap();
                 if n.widget != Widget::Chart {
                     n.value = Some(n.value.as_ref().and_then(|v| v.coerce(&ty)).unwrap_or_else(|| Value::default_for(&ty)));
                     if !n.widget.fits(&ty, is_ctl) && !matches!(n.kind, NodeKind::Constant(_)) {
@@ -848,11 +1199,211 @@ impl Editor {
                 vi.wires.retain(|w| !(w.to.0 == id && w.to.1 >= min_in) && !(w.from.0 == id && w.from.1 >= min_out));
                 Ok(None)
             }
+            Command::SetFrameView { id, frame } => {
+                let n = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
+                n.frame_view = frame.min(n.kind.frame_count().max(1) - 1);
+                Ok(None)
+            }
+            Command::AddFrame { id, after } => {
+                let st = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
+                let pos = (after + 1).min(st.kind.frame_count());
+                match &mut st.kind {
+                    NodeKind::Case { labels, default, fixed: None, .. } => {
+                        if labels.len() >= MAX_FRAMES {
+                            return Err(EditError::TooManyFrames);
+                        }
+                        labels.insert(pos, format!("Case {}", labels.len()));
+                        if let Some(d) = default {
+                            if *d >= pos {
+                                *d += 1;
+                            }
+                        }
+                    }
+                    NodeKind::Sequence { frames } => {
+                        *frames += 1;
+                        st.size[0] += 200.0;
+                    }
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                st.frame_view = pos;
+                let is_seq = matches!(st.kind, NodeKind::Sequence { .. });
+                let kids: Vec<NodeId> = vi.nodes.iter().filter(|n| n.parent == Some(id) && n.frame >= pos).map(|n| n.id).collect();
+                for k in kids {
+                    vi.node_mut(k).unwrap().frame += 1;
+                    if is_seq {
+                        let p = vi.node(k).unwrap().pos;
+                        Self::exec(vi, Command::MoveNode { id: k, pos: [p[0] + 200.0, p[1]] })?;
+                    }
+                }
+                remap_frame_wires(vi, id, pos, true);
+                Ok(None)
+            }
+            Command::RemoveFrame { id, frame } => {
+                let st = vi.node(id).ok_or(EditError::NoNode(id))?;
+                if !matches!(st.kind, NodeKind::Case { .. } | NodeKind::Sequence { .. } | NodeKind::Event { .. }) {
+                    return Err(EditError::WrongNodeKind(id));
+                }
+                if st.kind.frame_count() <= 1 {
+                    return Err(EditError::LastFrame);
+                }
+                if matches!(st.kind, NodeKind::Case { fixed: Some(_), .. }) || frame >= st.kind.frame_count() {
+                    return Err(EditError::WrongNodeKind(id));
+                }
+                let doomed: Vec<NodeId> = vi.nodes.iter().filter(|n| n.parent == Some(id) && n.frame == frame).map(|n| n.id).collect();
+                for d in doomed {
+                    remove_subtree(vi, d);
+                }
+                let is_seq = matches!(vi.node(id).unwrap().kind, NodeKind::Sequence { .. });
+                let later: Vec<NodeId> = vi.nodes.iter().filter(|n| n.parent == Some(id) && n.frame > frame).map(|n| n.id).collect();
+                for k in later {
+                    vi.node_mut(k).unwrap().frame -= 1;
+                    if is_seq {
+                        let p = vi.node(k).unwrap().pos;
+                        Self::exec(vi, Command::MoveNode { id: k, pos: [p[0] - 200.0, p[1]] })?;
+                    }
+                }
+                let st = vi.node_mut(id).unwrap();
+                match &mut st.kind {
+                    NodeKind::Case { labels, default, .. } => {
+                        labels.remove(frame);
+                        *default = match *default {
+                            Some(d) if d == frame => None,
+                            Some(d) if d > frame => Some(d - 1),
+                            d => d,
+                        };
+                    }
+                    NodeKind::Sequence { frames } => {
+                        *frames -= 1;
+                        st.size[0] -= 200.0;
+                    }
+                    NodeKind::Event { frames, .. } => {
+                        frames.remove(frame);
+                    }
+                    _ => {}
+                }
+                st.frame_view = st.frame_view.min(st.kind.frame_count() - 1);
+                remap_frame_wires(vi, id, frame, false);
+                Ok(None)
+            }
+            Command::SetFrameLabel { id, frame, label } => {
+                match &mut vi.node_mut(id).ok_or(EditError::NoNode(id))?.kind {
+                    NodeKind::Case { labels, .. } => *labels.get_mut(frame).ok_or(EditError::NoNode(id))? = label,
+                    NodeKind::Event { frames, .. } => frames.get_mut(frame).ok_or(EditError::NoNode(id))?.label = label,
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                Ok(None)
+            }
+            Command::SetDefaultFrame { id, frame } => {
+                match &mut vi.node_mut(id).ok_or(EditError::NoNode(id))?.kind {
+                    NodeKind::Case { default, labels, .. } => *default = frame.filter(|f| *f < labels.len()),
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                Ok(None)
+            }
+            Command::SetEnabledFrame { id, frame } => {
+                match &mut vi.node_mut(id).ok_or(EditError::NoNode(id))?.kind {
+                    NodeKind::Case { fixed: Some(f), labels, .. } => *f = frame.min(labels.len() - 1),
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                Ok(None)
+            }
+            Command::AddTunnel { id, ty } => {
+                let n = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
+                match &mut n.kind {
+                    NodeKind::Case { outs, .. } | NodeKind::Event { outs, .. } => outs.push(ty),
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                n.size[1] = n.size[1].max(110.0 + 30.0 * n.kind.tunnel_count() as f32);
+                Ok(None)
+            }
+            Command::RemoveTunnel { id } => {
+                let n = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
+                let k = match &mut n.kind {
+                    NodeKind::Case { outs, .. } | NodeKind::Event { outs, .. } if !outs.is_empty() => {
+                        outs.pop();
+                        outs.len()
+                    }
+                    NodeKind::Case { .. } | NodeKind::Event { .. } => return Ok(None),
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                };
+                let out_i = vi.node(id).unwrap().kind.tunnel_out_idx(k);
+                let base = NodeKind::tunnel_in_idx(k, 0);
+                vi.wires.retain(|w| !(w.to.0 == id && w.to.1 >= base && w.to.1 < base + MAX_FRAMES) && !(w.from.0 == id && w.from.1 == out_i));
+                Ok(None)
+            }
+            Command::AddEventFrame { id, source } => {
+                let frame = match source {
+                    Some(c) => {
+                        let (name, ty) = match &vi.node(c).ok_or(EditError::NoNode(c))?.kind {
+                            NodeKind::Control { name, ty } => (name.clone(), ty.clone()),
+                            _ => return Err(EditError::WrongNodeKind(c)),
+                        };
+                        EventFrame { label: format!("{name}: Value Change"), source: Some(c), ty }
+                    }
+                    None => EventFrame { label: "Timeout".into(), source: None, ty: DataType::Bool },
+                };
+                let n = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
+                match &mut n.kind {
+                    NodeKind::Event { frames, .. } => {
+                        if frames.len() >= MAX_FRAMES || (source.is_none() && frames.iter().any(|f| f.source.is_none())) {
+                            return Err(EditError::TooManyFrames);
+                        }
+                        frames.push(frame);
+                        n.frame_view = frames.len() - 1;
+                    }
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                Ok(None)
+            }
+            Command::SetLocalTarget { id, target } => {
+                let new_ty = match target {
+                    Some(t) => Some(vi.node(t).and_then(|n| n.data_type().filter(|_| n.kind.is_panel_item())).cloned().ok_or(EditError::WrongNodeKind(t))?),
+                    None => None,
+                };
+                match &mut vi.node_mut(id).ok_or(EditError::NoNode(id))?.kind {
+                    NodeKind::Local { target: t, ty, .. } => {
+                        *t = target;
+                        if let Some(nt) = new_ty {
+                            *ty = nt;
+                        }
+                    }
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                prune_invalid_wires(vi);
+                Ok(None)
+            }
+            Command::SetWrite { id, write: w } => {
+                match &mut vi.node_mut(id).ok_or(EditError::NoNode(id))?.kind {
+                    NodeKind::Local { write, .. } | NodeKind::Global { write, .. } => *write = w,
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                vi.wires.retain(|x| x.from.0 != id && x.to.0 != id);
+                Ok(None)
+            }
+            Command::SetGlobalName { id, name: new } => {
+                match &mut vi.node_mut(id).ok_or(EditError::NoNode(id))?.kind {
+                    NodeKind::Global { name, .. } => *name = new,
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                Ok(None)
+            }
+            Command::SetWireIndexing { to, enabled } => {
+                if let Some(i) = vi.wires.iter().position(|w| w.to == to) {
+                    let w = vi.wires[i];
+                    let crosses = !typing::crossing_loops(vi, w.from.0, w.to.0).0.is_empty() || !typing::crossing_loops(vi, w.from.0, w.to.0).1.is_empty();
+                    vi.wires[i].auto_index = enabled && crosses;
+                    prune_invalid_wires(vi);
+                }
+                Ok(None)
+            }
             Command::Drop(id) => {
                 let n = vi.node(id).ok_or(EditError::NoNode(id))?;
                 let center = [n.pos[0] + n.size[0] / 2.0, n.pos[1] + n.size[1] / 2.0];
                 let parent = vi.container_at(center, Some(id));
-                vi.node_mut(id).unwrap().parent = parent;
+                let frame = parent.map(|p| vi.frame_at(p, center)).unwrap_or(0);
+                let n = vi.node_mut(id).unwrap();
+                n.parent = parent;
+                n.frame = frame;
                 Ok(None)
             }
             Command::EndGesture => Ok(None),
@@ -881,8 +1432,10 @@ fn reaches(vi: &Vi, start: NodeId, target: NodeId) -> bool {
         }
         seen.push(n);
         for w in vi.wires.iter().filter(|w| w.from.0 == n) {
-            let inner = vi.node(w.to.0).and_then(|d| d.kind.inputs().get(w.to.1).map(|t| t.inner)).unwrap_or(false);
-            if !inner {
+            let dest = vi.node(w.to.0);
+            let inner = dest.and_then(|d| d.kind.inputs().get(w.to.1).map(|t| t.inner)).unwrap_or(false);
+            let delay = matches!(dest.map(|d| &d.kind), Some(NodeKind::Feedback { .. })) && w.to.1 == 0;
+            if !inner && !delay {
                 stack.push(w.to.0);
             }
         }
@@ -901,7 +1454,7 @@ fn refresh_size(vi: &mut Vi, id: NodeId) {
 /// Drops wires that no longer type-check after an upstream type change.
 fn prune_invalid_wires(vi: &mut Vi) {
     loop {
-        let bad = vi.wires.iter().position(|w| typing::check_connect(vi, w.from, w.to).is_err());
+        let bad = vi.wires.iter().position(|w| typing::check_connect(vi, w.from, w.to, w.auto_index).is_err());
         match bad {
             Some(i) => {
                 vi.wires.remove(i);
@@ -909,4 +1462,71 @@ fn prune_invalid_wires(vi: &mut Vi) {
             None => break,
         }
     }
+}
+
+fn remove_subtree(vi: &mut Vi, id: NodeId) {
+    let mut doomed = vi.descendants(id);
+    doomed.push(id);
+    vi.nodes.retain(|n| !doomed.contains(&n.id));
+    vi.wires.retain(|w| !doomed.contains(&w.from.0) && !doomed.contains(&w.to.0));
+    for n in vi.nodes.iter_mut() {
+        if let NodeKind::Local { target: Some(t), .. } = &mut n.kind {
+            if doomed.contains(t) {
+                n.kind = NodeKind::Local { target: None, ty: DataType::DBL, write: matches!(n.kind, NodeKind::Local { write: true, .. }) };
+            }
+        }
+    }
+}
+
+/// After inserting (`insert`) or removing a frame at `f`, renumber the per-frame tunnel and event terminals.
+fn remap_frame_wires(vi: &mut Vi, id: NodeId, f: usize, insert: bool) {
+    let is_event = matches!(vi.node(id).map(|n| &n.kind), Some(NodeKind::Event { .. }));
+    let mut keep = vec![];
+    for mut w in vi.wires.drain(..) {
+        if w.to.0 == id && w.to.1 >= 1 {
+            let (k, ff) = ((w.to.1 - 1) / MAX_FRAMES, (w.to.1 - 1) % MAX_FRAMES);
+            if insert && ff >= f {
+                w.to.1 = NodeKind::tunnel_in_idx(k, ff + 1);
+            } else if !insert && ff == f {
+                continue;
+            } else if !insert && ff > f {
+                w.to.1 = NodeKind::tunnel_in_idx(k, ff - 1);
+            }
+        }
+        if is_event && w.from.0 == id && w.from.1 < MAX_FRAMES {
+            if insert && w.from.1 >= f {
+                w.from.1 += 1;
+            } else if !insert && w.from.1 == f {
+                continue;
+            } else if !insert && w.from.1 > f {
+                w.from.1 -= 1;
+            }
+        }
+        keep.push(w);
+    }
+    vi.wires = keep;
+}
+
+/// Relabel an empty Case structure to match the type wired into its selector.
+fn sync_case_labels(vi: &mut Vi, id: NodeId, ty: &DataType) {
+    let has_children = vi.nodes.iter().any(|n| n.parent == Some(id));
+    let Some(NodeKind::Case { fixed: None, .. }) = vi.node(id).map(|n| n.kind.clone()) else { return };
+    if has_children {
+        return;
+    }
+    let (labels, default): (Vec<String>, Option<usize>) = match ty {
+        DataType::Bool => (vec!["False".into(), "True".into()], None),
+        DataType::Enum(items) if !items.is_empty() => (items.clone(), None),
+        DataType::Num(_) => (vec!["0".into(), "1".into()], Some(1)),
+        DataType::Str => (vec!["A".into(), "B".into()], Some(1)),
+        _ => return,
+    };
+    let n = vi.node_mut(id).unwrap();
+    if let NodeKind::Case { labels: l, default: d, .. } = &mut n.kind {
+        *l = labels;
+        *d = default;
+    }
+    n.frame_view = n.frame_view.min(n.kind.frame_count() - 1);
+    let count = n.kind.frame_count();
+    vi.wires.retain(|w| !(w.to.0 == id && w.to.1 >= 1 && (w.to.1 - 1) % MAX_FRAMES >= count));
 }

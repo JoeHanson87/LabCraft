@@ -1,5 +1,5 @@
 use crate::{diagram, panel, theme};
-use eframe::egui::{self, RichText};
+use eframe::egui::{self, Pos2, RichText};
 use labcraft_core::{run_with, Command, DataType, Editor, Field, LoopKind, NodeId, NodeKind, NumKind, RunControl, RunError, Value, Vi, Widget};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +16,7 @@ pub enum View {
 
 enum Msg {
     Indicator(NodeId, Value),
+    ControlWrite(NodeId, Value),
     Done(Result<(), RunError>),
 }
 
@@ -34,8 +35,11 @@ pub struct LabCraft {
     pub pending: Vec<Command>,
     running: Option<Running>,
     live: Arc<Mutex<HashMap<NodeId, Value>>>,
+    live_pushed: HashMap<NodeId, Value>,
+    globals: Arc<Mutex<HashMap<String, Value>>>,
     spawn_count: usize,
     pub editing_const: Option<NodeId>,
+    pub wire_menu: Option<((NodeId, usize), Pos2)>,
 }
 
 impl LabCraft {
@@ -50,8 +54,11 @@ impl LabCraft {
             pending: vec![],
             running: None,
             live: Arc::new(Mutex::new(HashMap::new())),
+            live_pushed: HashMap::new(),
+            globals: Arc::new(Mutex::new(HashMap::new())),
             spawn_count: 0,
             editing_const: None,
+            wire_menu: None,
         };
         app.load_example(Example::Loops);
         app
@@ -61,10 +68,12 @@ impl LabCraft {
         let mut ed = Editor::new(Vi::new(match ex {
             Example::Loops => "Loops and Graphs.vi",
             Example::Types => "Arrays and Clusters.vi",
+            Example::Structures => "Structures.vi",
         }));
         match ex {
             Example::Loops => demo_loops(&mut ed),
             Example::Types => demo_types(&mut ed),
+            Example::Structures => demo_structures(&mut ed),
         }
         self.ed = ed;
         self.selected = None;
@@ -93,11 +102,19 @@ impl LabCraft {
         let (tx, rx) = channel();
         let abort = Arc::new(AtomicBool::new(false));
         let txi = tx.clone();
+        let txc = tx.clone();
+        // Start every run from the controls' current panel values.
+        self.live.lock().unwrap().clear();
+        self.live_pushed.clear();
         let ctl = RunControl {
             abort: abort.clone(),
             live_controls: self.live.clone(),
+            globals: self.globals.clone(),
             on_indicator: Box::new(move |id, v| {
                 let _ = txi.send(Msg::Indicator(id, v.clone()));
+            }),
+            on_control_write: Box::new(move |id, v| {
+                let _ = txc.send(Msg::ControlWrite(id, v.clone()));
             }),
         };
         std::thread::spawn(move || {
@@ -116,16 +133,7 @@ impl LabCraft {
     }
 
     fn pump(&mut self) {
-        {
-            let mut live = self.live.lock().unwrap();
-            for n in self.ed.vi.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Control { .. })) {
-                if let Some(v) = &n.value {
-                    live.insert(n.id, v.clone());
-                }
-            }
-        }
-        let Some(r) = &self.running else { return };
-        let msgs: Vec<Msg> = r.rx.try_iter().collect();
+        let msgs: Vec<Msg> = self.running.as_ref().map(|r| r.rx.try_iter().collect()).unwrap_or_default();
         for m in msgs {
             match m {
                 Msg::Indicator(id, v) => {
@@ -142,6 +150,12 @@ impl LabCraft {
                         }
                     }
                 }
+                Msg::ControlWrite(id, v) => {
+                    if let Some(n) = self.ed.vi.node_mut(id) {
+                        n.value = Some(v.clone());
+                    }
+                    self.live_pushed.insert(id, v);
+                }
                 Msg::Done(res) => {
                     self.running = None;
                     match res {
@@ -154,6 +168,16 @@ impl LabCraft {
                         }
                     }
                     break;
+                }
+            }
+        }
+        // Publish control values the user changed so a running VI sees them (Stop buttons, events).
+        let mut live = self.live.lock().unwrap();
+        for n in self.ed.vi.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Control { .. })) {
+            if let Some(v) = &n.value {
+                if self.live_pushed.get(&n.id) != Some(v) {
+                    live.insert(n.id, v.clone());
+                    self.live_pushed.insert(n.id, v.clone());
                 }
             }
         }
@@ -223,6 +247,7 @@ impl LabCraft {
 pub enum Example {
     Loops,
     Types,
+    Structures,
 }
 
 struct PanelItem {
@@ -303,6 +328,15 @@ fn diagram_palette() -> Vec<(&'static str, DataType, Vec<(String, NodeKind)>)> {
         ("Structures", DataType::I32, vec![
             l("While Loop", NodeKind::Loop { kind: LoopKind::While, regs: vec![] }),
             l("For Loop", NodeKind::Loop { kind: LoopKind::For, regs: vec![] }),
+            l("Case Structure", NodeKind::Case { labels: vec!["False".into(), "True".into()], default: None, outs: vec![], fixed: None }),
+            l("Flat Sequence", NodeKind::Sequence { frames: 2 }),
+            l("Event Structure", NodeKind::Event { frames: vec![], outs: vec![] }),
+            l("Diagram Disable Structure", NodeKind::Case { labels: vec!["Disabled".into(), "Enabled".into()], default: None, outs: vec![], fixed: Some(1) }),
+        ]),
+        ("Variables", DataType::Cluster(vec![]), vec![
+            l("Local Variable", NodeKind::Local { target: None, ty: DataType::DBL, write: false }),
+            l("Global Variable", NodeKind::Global { name: "Global 1".into(), ty: DataType::DBL, write: false }),
+            l("Feedback Node", NodeKind::Feedback { ty: DataType::DBL }),
         ]),
         ("Numeric", DataType::DBL, vec![
             l("Add", NodeKind::Add), l("Subtract", NodeKind::Subtract), l("Multiply", NodeKind::Multiply), l("Divide", NodeKind::Divide),
@@ -404,6 +438,99 @@ fn demo_loops(ed: &mut Editor) {
         ed.apply(Command::SetRange { id, range }).unwrap();
     }
     set(ed, amp, Value::Dbl(5.0));
+}
+
+/// M4 demo: Case structure selected by an enum, auto-indexing, a Feedback Node, and an Event
+/// structure inside a While loop that counts button presses and shows the count via a Local Variable.
+fn demo_structures(ed: &mut Editor) {
+    let ctl = |name: &str, ty| NodeKind::Control { name: name.into(), ty };
+    let ind = |name: &str, ty| NodeKind::Indicator { name: name.into(), ty };
+    let view = |ed: &mut Editor, id, frame| ed.apply(Command::SetFrameView { id, frame }).unwrap();
+
+    // --- Case structure chosen by an enum ---
+    let mode_ty = DataType::Enum(vec!["Square".into(), "Double".into(), "Negate".into()]);
+    let x = add(ed, ctl("x", DataType::DBL), [20.0, 20.0], None);
+    let mode = add(ed, ctl("Operation", mode_ty), [20.0, 100.0], None);
+    set(ed, x, Value::Dbl(7.0));
+    set(ed, mode, Value::Int(1));
+    let case = add(ed, NodeKind::Case { labels: vec!["False".into(), "True".into()], default: None, outs: vec![], fixed: None }, [170.0, 20.0], None);
+    ed.apply(Command::Resize { id: case, size: [330.0, 210.0] }).unwrap();
+    wire(ed, (mode, 0), (case, 0)); // frames take the enum's item names
+    ed.apply(Command::AddTunnel { id: case, ty: DataType::DBL }).unwrap();
+    view(ed, case, 0);
+    let sq = add(ed, NodeKind::Multiply, [200.0, 70.0], None);
+    wire(ed, (x, 0), (sq, 0));
+    wire(ed, (x, 0), (sq, 1));
+    wire(ed, (sq, 0), (case, NodeKind::tunnel_in_idx(0, 0)));
+    view(ed, case, 1);
+    let dbl = add(ed, NodeKind::Multiply, [200.0, 70.0], None);
+    let two = konst(ed, DataType::DBL, Value::Dbl(2.0), [330.0, 70.0]);
+    wire(ed, (x, 0), (dbl, 0));
+    wire(ed, (two, 0), (dbl, 1));
+    wire(ed, (dbl, 0), (case, NodeKind::tunnel_in_idx(0, 1)));
+    view(ed, case, 2);
+    let neg = add(ed, NodeKind::Negate, [200.0, 70.0], None);
+    wire(ed, (x, 0), (neg, 0));
+    wire(ed, (neg, 0), (case, NodeKind::tunnel_in_idx(0, 2)));
+    view(ed, case, 1);
+    let result = add(ed, ind("Result", DataType::DBL), [540.0, 90.0], None);
+    wire(ed, (case, 0), (result, 0));
+
+    // --- Auto-indexing: the For loop count comes from the array, results are gathered ---
+    let values = add(ed, ctl("Values", DataType::arr_dbl()), [20.0, 260.0], None);
+    set(ed, values, Value::from_f64_vec(&[1.0, 2.0, 3.0, 4.0, 5.0]));
+    let f1 = add(ed, NodeKind::Loop { kind: LoopKind::For, regs: vec![] }, [170.0, 260.0], None);
+    ed.apply(Command::Resize { id: f1, size: [330.0, 190.0] }).unwrap();
+    let m10 = add(ed, NodeKind::Multiply, [200.0, 310.0], None);
+    let ten = konst(ed, DataType::DBL, Value::Dbl(10.0), [340.0, 310.0], );
+    let times = add(ed, ind("Times Ten", DataType::arr_dbl()), [540.0, 310.0], None);
+    wire(ed, (values, 0), (m10, 0));
+    wire(ed, (ten, 0), (m10, 1));
+    wire(ed, (m10, 0), (times, 0));
+
+    // --- Feedback Node: running sum, gathered into a graph ---
+    let n8 = konst(ed, DataType::I32, Value::Int(8), [600.0, 420.0]);
+    let f2 = add(ed, NodeKind::Loop { kind: LoopKind::For, regs: vec![] }, [740.0, 380.0], None);
+    ed.apply(Command::Resize { id: f2, size: [340.0, 190.0] }).unwrap();
+    let fb = add(ed, NodeKind::Feedback { ty: DataType::DBL }, [770.0, 430.0], None);
+    let acc = add(ed, NodeKind::Add, [920.0, 430.0], None);
+    let sums = add(ed, ind("Running Sum", DataType::arr_dbl()), [880.0, 600.0], Some(Widget::Graph));
+    wire(ed, (n8, 0), (f2, 0));
+    wire(ed, (acc, 0), (fb, 0));
+    wire(ed, (fb, 0), (acc, 0));
+    wire(ed, (f2, 0), (acc, 1));
+    wire(ed, (acc, 0), (sums, 0));
+
+    // --- Event structure in a While loop: count button presses ---
+    let add_btn = add(ed, ctl("Add", DataType::Bool), [600.0, 20.0], Some(Widget::PushButton));
+    let stop = add(ed, ctl("Stop", DataType::Bool), [600.0, 120.0], Some(Widget::PushButton));
+    let zero = konst(ed, DataType::DBL, Value::Dbl(0.0), [600.0, 230.0]);
+    let timeout = konst(ed, DataType::I32, Value::Int(100), [600.0, 300.0]);
+    let wl = add(ed, NodeKind::Loop { kind: LoopKind::While, regs: vec![DataType::DBL] }, [740.0, 20.0], None);
+    ed.apply(Command::Resize { id: wl, size: [340.0, 340.0] }).unwrap();
+    let ev = add(ed, NodeKind::Event { frames: vec![], outs: vec![] }, [770.0, 50.0], None);
+    ed.apply(Command::Resize { id: ev, size: [260.0, 170.0] }).unwrap();
+    ed.apply(Command::Drop(ev)).unwrap();
+    ed.apply(Command::AddEventFrame { id: ev, source: Some(add_btn) }).unwrap();
+    ed.apply(Command::AddEventFrame { id: ev, source: None }).unwrap();
+    ed.apply(Command::AddTunnel { id: ev, ty: DataType::DBL }).unwrap();
+    view(ed, ev, 0);
+    let inc = add(ed, NodeKind::Increment, [800.0, 100.0], None);
+    wire(ed, (wl, 1), (inc, 0));
+    wire(ed, (inc, 0), (ev, NodeKind::tunnel_in_idx(0, 0)));
+    view(ed, ev, 1);
+    let keep = add(ed, NodeKind::Convert(NumKind::Dbl), [800.0, 100.0], None);
+    wire(ed, (wl, 1), (keep, 0));
+    wire(ed, (keep, 0), (ev, NodeKind::tunnel_in_idx(0, 1)));
+    view(ed, ev, 0);
+    let count = add(ed, ind("Count", DataType::DBL), [600.0, 330.0], None);
+    let show = add(ed, NodeKind::Local { target: None, ty: DataType::DBL, write: true }, [800.0, 260.0], None);
+    ed.apply(Command::SetLocalTarget { id: show, target: Some(count) }).unwrap();
+    wire(ed, (zero, 0), (wl, 1));
+    wire(ed, (timeout, 0), (ev, 0));
+    wire(ed, (ev, labcraft_core::MAX_FRAMES), (wl, 2)); // tunnel -> next count
+    wire(ed, (ev, labcraft_core::MAX_FRAMES), (show, 0)); // tunnel -> Local Variable (write Count)
+    wire(ed, (stop, 0), (wl, 0));
 }
 
 /// M3 demo: typed numerics, array/cluster polymorphism, enums, Select, Bundle/Unbundle.
@@ -534,6 +661,10 @@ impl eframe::App for LabCraft {
                         self.load_example(Example::Types);
                         ui.close();
                     }
+                    if ui.button("Structures").clicked() {
+                        self.load_example(Example::Structures);
+                        ui.close();
+                    }
                 });
                 if ui.button("Open").clicked() {
                     let path = format!("{}.json", self.ed.vi.name);
@@ -611,6 +742,20 @@ mod tests {
     }
 
     #[test]
+    fn structures_demo_runs_headless() {
+        let mut ed = Editor::new(Vi::new("t"));
+        demo_structures(&mut ed);
+        let stop = find(&ed, "Stop");
+        set(&mut ed, stop, Value::Bool(true));
+        let res = labcraft_core::run(&ed.vi).unwrap();
+        let get = |t: &str| res.indicators.iter().find(|(id, _)| *id == find(&ed, t)).unwrap().1.clone();
+        assert_eq!(get("Result"), Value::Dbl(14.0)); // "Double" frame: 7 * 2
+        assert_eq!(get("Times Ten"), Value::from_f64_vec(&[10.0, 20.0, 30.0, 40.0, 50.0]));
+        assert_eq!(get("Running Sum"), Value::from_f64_vec(&[0.0, 1.0, 3.0, 6.0, 10.0, 15.0, 21.0, 28.0]));
+        assert_eq!(get("Count"), Value::Dbl(0.0)); // the event timed out; nobody pressed Add
+    }
+
+    #[test]
     fn palettes_build_valid_nodes() {
         // every palette entry must be addable to a VI without error
         let mut ed = Editor::new(Vi::new("t"));
@@ -630,14 +775,19 @@ mod tests {
 
     #[test]
     fn examples_render_in_both_views_without_panicking() {
-        for ex in [Example::Loops, Example::Types] {
+        for ex in [Example::Loops, Example::Types, Example::Structures] {
             for view in [View::FrontPanel, View::BlockDiagram] {
                 let mut app = LabCraft::new();
                 app.load_example(ex);
                 app.view = view;
                 let ctx = egui::Context::default();
                 crate::theme::apply(&ctx);
-                for _ in 0..3 {
+                let multi: Vec<(NodeId, usize)> = app.ed.vi.nodes.iter().filter(|n| n.kind.frame_count() > 1).map(|n| (n.id, n.kind.frame_count())).collect();
+                for round in 0..4 {
+                    // show every frame of every multi-frame structure
+                    for (id, count) in &multi {
+                        app.ed.apply(Command::SetFrameView { id: *id, frame: round % count }).unwrap();
+                    }
                     let input = egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
                         ..Default::default()

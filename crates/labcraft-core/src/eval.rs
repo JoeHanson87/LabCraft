@@ -1,10 +1,11 @@
-use crate::model::{LoopKind, NodeId, NodeKind, Spec, Vi};
+use crate::model::{EventFrame, LoopKind, NodeId, NodeKind, Spec, Vi, Wire, MAX_FRAMES};
 use crate::ops::{self, BinOp, Cmp, Logic, Unary};
 use crate::typing::{self, TypeMap};
-use crate::types::{DataType, Value};
+use crate::types::{ArrayVal, DataType, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const ITERATION_LIMIT: i64 = 50_000_000;
 
@@ -29,7 +30,11 @@ pub struct RunControl {
     pub abort: Arc<AtomicBool>,
     /// Latest control values, read live so a Stop button works inside a running loop.
     pub live_controls: Arc<Mutex<HashMap<NodeId, Value>>>,
+    /// Global variables, shared by name across the VI and across runs.
+    pub globals: Arc<Mutex<HashMap<String, Value>>>,
     pub on_indicator: Box<dyn Fn(NodeId, &Value) + Send + Sync>,
+    /// Called when a Local Variable writes to a control, so the panel can show it.
+    pub on_control_write: Box<dyn Fn(NodeId, &Value) + Send + Sync>,
 }
 
 impl RunControl {
@@ -37,7 +42,9 @@ impl RunControl {
         RunControl {
             abort: Arc::new(AtomicBool::new(false)),
             live_controls: Arc::new(Mutex::new(HashMap::new())),
+            globals: Arc::new(Mutex::new(HashMap::new())),
             on_indicator: Box::new(|_, _| {}),
+            on_control_write: Box::new(|_, _| {}),
         }
     }
 }
@@ -53,11 +60,24 @@ pub fn run(vi: &Vi) -> Result<RunResult, RunError> {
     run_with(vi, &RunControl::headless())
 }
 
-/// Execute a VI in dataflow order, including loops and shift registers.
+/// Execute a VI in dataflow order. Loops, Case/Sequence/Event structures, auto-indexing and
+/// feedback are supported; independent structures run on separate threads.
 pub fn run_with(vi: &Vi, ctl: &RunControl) -> Result<RunResult, RunError> {
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1) | 1;
-    let mut cx = Ctx { vi, ctl, types: typing::resolve(vi), env: HashMap::new(), indicators: HashMap::new(), rng: seed };
-    cx.eval_scope(None)?;
+    let types = typing::resolve(vi);
+    let mut cx = Ctx {
+        vi,
+        ctl,
+        types: &types,
+        env: HashMap::new(),
+        indicators: HashMap::new(),
+        tun: HashMap::new(),
+        feedback: HashMap::new(),
+        event_last: HashMap::new(),
+        iter: vec![],
+        rng: seed,
+    };
+    cx.eval_scope(None, None, &mut HashSet::new())?;
     let mut indicators: Vec<_> = cx.indicators.into_iter().collect();
     indicators.sort_by_key(|(id, _)| *id);
     Ok(RunResult { outputs: cx.env, indicators })
@@ -66,15 +86,64 @@ pub fn run_with(vi: &Vi, ctl: &RunControl) -> Result<RunResult, RunError> {
 struct Ctx<'a> {
     vi: &'a Vi,
     ctl: &'a RunControl,
-    types: TypeMap,
+    types: &'a TypeMap,
     env: HashMap<(NodeId, usize), Value>,
     indicators: HashMap<NodeId, Value>,
+    /// Values gathered by auto-indexed wires that left a loop, keyed by the wire's destination.
+    tun: HashMap<(NodeId, usize), Value>,
+    feedback: HashMap<NodeId, Value>,
+    /// Last seen value of each control an Event structure watches.
+    event_last: HashMap<(NodeId, NodeId), Value>,
+    /// Active loops and their current iteration, outermost first.
+    iter: Vec<(NodeId, i64)>,
     rng: u64,
 }
 
-impl Ctx<'_> {
+/// Stack per-iteration values into an array (adding a leading dimension).
+fn stack_values(vals: Vec<Value>) -> Value {
+    let n = vals.len();
+    let mut dims = vec![n];
+    let mut data = Vec::new();
+    for (i, v) in vals.into_iter().enumerate() {
+        match v {
+            Value::Array(a) => {
+                if i == 0 {
+                    dims.extend(a.dims.iter().copied());
+                }
+                data.extend(a.data);
+            }
+            other => data.push(other),
+        }
+    }
+    Value::Array(ArrayVal { dims, data })
+}
+
+impl<'a> Ctx<'a> {
     fn check_abort(&self) -> Result<(), RunError> {
         if self.ctl.abort.load(Ordering::Relaxed) { Err(RunError::Aborted) } else { Ok(()) }
+    }
+
+    fn fork(&self, salt: u64) -> Ctx<'a> {
+        Ctx {
+            vi: self.vi,
+            ctl: self.ctl,
+            types: self.types,
+            env: self.env.clone(),
+            indicators: HashMap::new(),
+            tun: self.tun.clone(),
+            feedback: self.feedback.clone(),
+            event_last: self.event_last.clone(),
+            iter: self.iter.clone(),
+            rng: self.rng.rotate_left(17 * (salt as u32 + 1)) | 1,
+        }
+    }
+
+    fn merge(&mut self, child: Ctx<'a>) {
+        self.env.extend(child.env);
+        self.indicators.extend(child.indicators);
+        self.tun.extend(child.tun);
+        self.feedback.extend(child.feedback);
+        self.event_last.extend(child.event_last);
     }
 
     /// The child of `scope` that contains (or is) `s`; `None` if `s` is outside `scope`.
@@ -107,40 +176,139 @@ impl Ctx<'_> {
         out
     }
 
-    fn eval_scope(&mut self, scope: Option<NodeId>) -> Result<(), RunError> {
-        let mut remaining: Vec<NodeId> = self.vi.nodes.iter().filter(|n| n.parent == scope).map(|n| n.id).collect();
-        let mut done: HashSet<NodeId> = HashSet::new();
+    /// Run the nodes of `scope` (restricted to one `frame` if given) until all have fired.
+    /// Ready structures run concurrently.
+    fn eval_scope(&mut self, scope: Option<NodeId>, frame: Option<usize>, done: &mut HashSet<NodeId>) -> Result<(), RunError> {
+        let mut remaining: Vec<NodeId> = self.vi.nodes.iter().filter(|n| n.parent == scope && frame.is_none_or(|f| n.frame == f)).map(|n| n.id).collect();
+        // Feedback nodes present last iteration's value up front and store the new one at the end.
+        let fbs: Vec<NodeId> = remaining.iter().copied().filter(|id| matches!(self.vi.node(*id).map(|n| &n.kind), Some(NodeKind::Feedback { .. }))).collect();
+        remaining.retain(|id| !fbs.contains(id));
+        for id in &fbs {
+            let Some(NodeKind::Feedback { ty }) = self.vi.node(*id).map(|n| &n.kind) else { continue };
+            let v = match self.feedback.get(id) {
+                Some(v) => v.clone(),
+                None => self.read_input(*id, 1, Some(ty)).ok().flatten().unwrap_or_else(|| Value::default_for(ty)),
+            };
+            self.feedback.insert(*id, v.clone());
+            self.env.insert((*id, 0), v);
+            done.insert(*id);
+        }
         while !remaining.is_empty() {
             self.check_abort()?;
-            let before = remaining.len();
-            let mut still = vec![];
-            for id in remaining {
-                if self.deps(id, scope).iter().any(|d| !done.contains(d)) {
-                    still.push(id);
-                    continue;
-                }
+            let ready: Vec<NodeId> = remaining.iter().copied().filter(|id| self.deps(*id, scope).iter().all(|d| done.contains(d))).collect();
+            if ready.is_empty() {
+                return Err(RunError::Cycle);
+            }
+            let (structs, plain): (Vec<NodeId>, Vec<NodeId>) = ready.into_iter().partition(|id| self.vi.node(*id).is_some_and(|n| n.kind.is_structure()));
+            for id in plain {
                 self.fire(id)?;
                 done.insert(id);
             }
-            if still.len() == before {
-                return Err(RunError::Cycle);
+            if structs.len() >= 2 {
+                self.fire_parallel(&structs)?;
+                done.extend(structs.iter().copied());
+            } else {
+                for id in structs {
+                    self.fire(id)?;
+                    done.insert(id);
+                }
             }
-            remaining = still;
+            remaining.retain(|id| !done.contains(id));
+        }
+        for id in &fbs {
+            let Some(NodeKind::Feedback { ty }) = self.vi.node(*id).map(|n| &n.kind) else { continue };
+            if let Some(v) = self.read_input(*id, 0, Some(ty))? {
+                self.feedback.insert(*id, v);
+            }
         }
         Ok(())
+    }
+
+    fn fire_parallel(&mut self, ids: &[NodeId]) -> Result<(), RunError> {
+        let results: Vec<(Result<(), RunError>, Ctx<'a>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    let mut child = self.fork(i as u64);
+                    s.spawn(move || {
+                        let r = child.fire(id);
+                        if r.is_err() {
+                            child.ctl.abort.store(true, Ordering::Relaxed);
+                        }
+                        (r, child)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("structure thread panicked")).collect()
+        });
+        let mut first_err: Option<RunError> = None;
+        for (r, child) in results {
+            self.merge(child);
+            if let Err(e) = r {
+                if first_err.is_none() || first_err == Some(RunError::Aborted) {
+                    first_err = Some(e);
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    fn live_value(&self, id: NodeId) -> Value {
+        let node = self.vi.node(id);
+        let default = match node.map(|n| &n.kind) {
+            Some(NodeKind::Control { ty, .. }) => Value::default_for(ty),
+            _ => Value::Bool(false),
+        };
+        self.ctl.live_controls.lock().ok().and_then(|m| m.get(&id).cloned()).or_else(|| node.and_then(|n| n.value.clone())).unwrap_or(default)
+    }
+
+    /// The raw value on a wire, before auto-index slicing.
+    fn base_value(&self, w: &Wire) -> Result<Value, RunError> {
+        let src = self.vi.node(w.from.0).ok_or_else(|| RunError::Internal("dangling wire".into()))?;
+        if matches!(src.kind, NodeKind::Control { .. }) {
+            return Ok(self.live_value(src.id));
+        }
+        if w.auto_index {
+            if let Some(v) = self.tun.get(&w.to) {
+                return Ok(v.clone());
+            }
+        }
+        self.env.get(&w.from).cloned().ok_or_else(|| RunError::Internal(format!("node {} not ready", w.from.0)))
+    }
+
+    /// Hand out one element per iteration for each auto-indexed loop the wire has entered so far.
+    fn apply_entering(&self, w: &Wire, mut v: Value) -> Value {
+        if !w.auto_index {
+            return v;
+        }
+        let (_, entering) = typing::crossing_loops(self.vi, w.from.0, w.to.0);
+        for l in entering {
+            let Some((_, i)) = self.iter.iter().find(|(id, _)| *id == l) else { break };
+            let elem_default = match &v {
+                Value::Array(a) => a.data.first().map(|e| match e {
+                    Value::Int(_) => Value::Int(0),
+                    Value::Bool(_) => Value::Bool(false),
+                    Value::Str(_) => Value::Str(String::new()),
+                    _ => Value::Dbl(0.0),
+                }),
+                _ => None,
+            };
+            let out_ty = match &elem_default {
+                Some(Value::Int(_)) => DataType::I32,
+                Some(Value::Bool(_)) => DataType::Bool,
+                Some(Value::Str(_)) => DataType::Str,
+                _ => DataType::DBL,
+            };
+            v = ops::index_array(&v, &[*i], &out_ty);
+        }
+        v
     }
 
     /// Value on the wire into `(id, idx)`, optionally coerced to `ty`.
     fn read_input(&self, id: NodeId, idx: usize, ty: Option<&DataType>) -> Result<Option<Value>, RunError> {
         let Some(w) = self.vi.wires.iter().find(|w| w.to == (id, idx)) else { return Ok(None) };
-        let src = self.vi.node(w.from.0).ok_or_else(|| RunError::Internal("dangling wire".into()))?;
-        let raw = match &src.kind {
-            NodeKind::Control { ty: cty, .. } => {
-                let live = self.ctl.live_controls.lock().ok().and_then(|m| m.get(&src.id).cloned());
-                live.or_else(|| src.value.clone()).unwrap_or(Value::default_for(cty))
-            }
-            _ => self.env.get(&w.from).cloned().ok_or_else(|| RunError::Internal(format!("node {} not ready", w.from.0)))?,
-        };
+        let raw = self.apply_entering(w, self.base_value(w)?);
         match ty {
             Some(t) => raw.coerce(t).map(Some).ok_or_else(|| RunError::Internal("type mismatch on wire".into())),
             None => Ok(Some(raw)),
@@ -150,8 +318,18 @@ impl Ctx<'_> {
     fn fire(&mut self, id: NodeId) -> Result<(), RunError> {
         let node = self.vi.node(id).ok_or_else(|| RunError::Internal("missing node".into()))?;
         let kind = node.kind.clone();
-        if let NodeKind::Loop { kind: lk, regs } = &kind {
-            return self.fire_loop(id, *lk, regs);
+        match &kind {
+            NodeKind::Loop { kind: lk, regs } => return self.fire_loop(id, *lk, regs),
+            NodeKind::Case { labels, default, outs, fixed } => return self.fire_case(id, labels, *default, outs, *fixed),
+            NodeKind::Sequence { frames } => {
+                let mut done = HashSet::new();
+                for f in 0..*frames {
+                    self.eval_scope(Some(id), Some(f), &mut done)?;
+                }
+                return Ok(());
+            }
+            NodeKind::Event { frames, outs } => return self.fire_event(id, frames, outs),
+            _ => {}
         }
         let mut args: Vec<Option<Value>> = Vec::new();
         for (i, t) in kind.inputs().iter().enumerate() {
@@ -176,33 +354,86 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// Auto-indexed wires entering and leaving loop `id`.
+    fn auto_wires(&self, id: NodeId) -> (Vec<Wire>, Vec<Wire>) {
+        let (mut entering, mut leaving) = (vec![], vec![]);
+        for w in self.vi.wires.iter().filter(|w| w.auto_index) {
+            let (l, e) = typing::crossing_loops(self.vi, w.from.0, w.to.0);
+            if e.contains(&id) {
+                entering.push(*w);
+            }
+            if l.contains(&id) {
+                leaving.push(*w);
+            }
+        }
+        (entering, leaving)
+    }
+
     fn fire_loop(&mut self, id: NodeId, kind: LoopKind, regs: &[DataType]) -> Result<(), RunError> {
+        let (entering, leaving) = self.auto_wires(id);
+        for d in self.vi.descendants(id) {
+            self.feedback.remove(&d);
+        }
+        for w in &leaving {
+            self.tun.remove(&w.to);
+        }
         let count = match kind {
-            LoopKind::For => match self.read_input(id, 0, Some(&DataType::I32))? {
-                Some(Value::Int(n)) => n,
-                _ => return Err(RunError::Unwired(id, "For Loop".into(), "N".into())),
-            },
+            LoopKind::For => {
+                let mut c = match self.read_input(id, 0, Some(&DataType::I32))? {
+                    Some(Value::Int(n)) => Some(n),
+                    _ => None,
+                };
+                for w in &entering {
+                    if let Value::Array(a) = self.apply_entering(w, self.base_value(w)?) {
+                        let len = a.dims.first().copied().unwrap_or(0) as i64;
+                        c = Some(c.map_or(len, |x| x.min(len)));
+                    }
+                }
+                c.ok_or_else(|| RunError::Unwired(id, "For Loop".into(), "N".into()))?
+            }
             LoopKind::While => i64::MAX,
         };
         let mut state = Vec::with_capacity(regs.len());
         for (k, ty) in regs.iter().enumerate() {
             state.push(self.read_input(id, 1 + 2 * k, Some(ty))?.unwrap_or(Value::default_for(ty)));
         }
+        let mut gathered: Vec<Vec<Value>> = vec![vec![]; leaving.len()];
+        self.iter.push((id, 0));
+        let result = self.loop_body(id, kind, regs, count, &mut state, &leaving, &mut gathered);
+        self.iter.pop();
+        result?;
+        for (w, vals) in leaving.iter().zip(gathered) {
+            self.tun.insert(w.to, stack_values(vals));
+        }
+        for (k, s) in state.into_iter().enumerate() {
+            self.env.insert((id, 2 + 2 * k), s);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn loop_body(&mut self, id: NodeId, kind: LoopKind, regs: &[DataType], count: i64, state: &mut [Value], leaving: &[Wire], gathered: &mut [Vec<Value>]) -> Result<(), RunError> {
         let mut i = 0i64;
         while i < count {
             self.check_abort()?;
             if i >= ITERATION_LIMIT {
                 return Err(RunError::IterationLimit(id));
             }
+            if let Some(top) = self.iter.last_mut() {
+                top.1 = i;
+            }
             self.env.insert((id, 0), Value::Int(i));
             for (k, s) in state.iter().enumerate() {
                 self.env.insert((id, 1 + 2 * k), s.clone());
             }
-            self.eval_scope(Some(id))?;
+            self.eval_scope(Some(id), None, &mut HashSet::new())?;
             for (k, ty) in regs.iter().enumerate() {
                 if let Some(v) = self.read_input(id, 2 + 2 * k, Some(ty))? {
                     state[k] = v;
                 }
+            }
+            for (w, g) in leaving.iter().zip(gathered.iter_mut()) {
+                g.push(self.base_value(w)?);
             }
             i += 1;
             if kind == LoopKind::While {
@@ -213,8 +444,83 @@ impl Ctx<'_> {
                 }
             }
         }
-        for (k, s) in state.into_iter().enumerate() {
-            self.env.insert((id, 2 + 2 * k), s);
+        Ok(())
+    }
+
+    /// Which frame of a Case structure runs for the wired selector.
+    fn case_frame(&self, id: NodeId, labels: &[String], default: Option<usize>, fixed: Option<usize>) -> Result<usize, RunError> {
+        if let Some(f) = fixed {
+            return Ok(f.min(labels.len().saturating_sub(1)));
+        }
+        let sel = self.read_input(id, 0, None)?.ok_or_else(|| RunError::Unwired(id, "Case Structure".into(), "?".into()))?;
+        let enum_items = match self.types.input(self.vi, id, 0) {
+            Some(DataType::Enum(items)) => Some(items),
+            _ => None,
+        };
+        let (key, num): (String, Option<i64>) = match (&sel, &enum_items) {
+            (Value::Bool(b), _) => ((if *b { "True" } else { "False" }).into(), None),
+            (Value::Int(i), Some(items)) => (items.get(*i as usize).cloned().unwrap_or_default(), Some(*i)),
+            (Value::Int(i), None) => (i.to_string(), Some(*i)),
+            (Value::Dbl(d), _) => ((d.round() as i64).to_string(), Some(d.round() as i64)),
+            (Value::Str(s), _) => (s.clone(), None),
+            _ => (String::new(), None),
+        };
+        let hit = labels.iter().position(|l| label_matches(l, &key, num));
+        Ok(hit.or(default).unwrap_or(0))
+    }
+
+    fn fire_case(&mut self, id: NodeId, labels: &[String], default: Option<usize>, outs: &[DataType], fixed: Option<usize>) -> Result<(), RunError> {
+        let frame = self.case_frame(id, labels, default, fixed)?;
+        self.eval_scope(Some(id), Some(frame), &mut HashSet::new())?;
+        for (k, ty) in outs.iter().enumerate() {
+            let v = self.read_input(id, NodeKind::tunnel_in_idx(k, frame), Some(ty))?.unwrap_or_else(|| Value::default_for(ty));
+            self.env.insert((id, k), v);
+        }
+        Ok(())
+    }
+
+    fn fire_event(&mut self, id: NodeId, frames: &[EventFrame], outs: &[DataType]) -> Result<(), RunError> {
+        let timeout = self.read_input(id, 0, Some(&DataType::I32))?.and_then(|v| v.as_i64()).unwrap_or(-1);
+        let start = Instant::now();
+        let chosen: Option<(usize, Option<Value>)> = loop {
+            self.check_abort()?;
+            let mut hit = None;
+            for (f, fr) in frames.iter().enumerate() {
+                if let Some(src) = fr.source {
+                    let cur = self.live_value(src);
+                    let last = self.event_last.entry((id, src)).or_insert_with(|| cur.clone());
+                    if *last != cur {
+                        *last = cur.clone();
+                        hit = Some((f, Some(cur)));
+                        break;
+                    }
+                }
+            }
+            if hit.is_some() {
+                break hit;
+            }
+            if timeout >= 0 && start.elapsed() >= Duration::from_millis(timeout as u64) {
+                break frames.iter().position(|f| f.source.is_none()).map(|f| (f, None));
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        };
+        let out_base = MAX_FRAMES;
+        match chosen {
+            Some((f, data)) => {
+                if let Some(v) = data {
+                    self.env.insert((id, f), v);
+                }
+                self.eval_scope(Some(id), Some(f), &mut HashSet::new())?;
+                for (k, ty) in outs.iter().enumerate() {
+                    let v = self.read_input(id, NodeKind::tunnel_in_idx(k, f), Some(ty))?.unwrap_or_else(|| Value::default_for(ty));
+                    self.env.insert((id, out_base + k), v);
+                }
+            }
+            None => {
+                for (k, ty) in outs.iter().enumerate() {
+                    self.env.insert((id, out_base + k), Value::default_for(ty));
+                }
+            }
         }
         Ok(())
     }
@@ -239,7 +545,42 @@ impl Ctx<'_> {
                 vec![live.or_else(|| own.cloned()).unwrap_or(Value::default_for(ty))]
             }
             NodeKind::Constant(ty) => vec![own.cloned().unwrap_or_else(|| Value::default_for(ty))],
-            NodeKind::Indicator { .. } | NodeKind::Loop { .. } => vec![],
+            NodeKind::Indicator { .. } | NodeKind::Loop { .. } | NodeKind::Case { .. } | NodeKind::Sequence { .. } | NodeKind::Event { .. } | NodeKind::Feedback { .. } => vec![],
+            NodeKind::Local { target, ty, write } => {
+                let Some(t) = target else { return Ok(if *write { vec![] } else { vec![Value::default_for(ty)] }) };
+                let tnode = self.vi.node(*t).ok_or_else(|| RunError::Internal("local variable target missing".into()))?;
+                if *write {
+                    let v = req(0)?.clone();
+                    match tnode.kind {
+                        NodeKind::Control { .. } => {
+                            if let Ok(mut m) = self.ctl.live_controls.lock() {
+                                m.insert(*t, v.clone());
+                            }
+                            (self.ctl.on_control_write)(*t, &v);
+                        }
+                        _ => {
+                            (self.ctl.on_indicator)(*t, &v);
+                            self.indicators.insert(*t, v);
+                        }
+                    }
+                    vec![]
+                } else {
+                    let v = match tnode.kind {
+                        NodeKind::Control { .. } => self.live_value(*t),
+                        _ => self.indicators.get(t).cloned().or_else(|| tnode.value.clone()).unwrap_or_else(|| Value::default_for(ty)),
+                    };
+                    vec![v.coerce(ty).unwrap_or(v)]
+                }
+            }
+            NodeKind::Global { name, ty, write } => {
+                let mut g = self.ctl.globals.lock().map_err(|_| RunError::Internal("globals poisoned".into()))?;
+                if *write {
+                    g.insert(name.clone(), req(0)?.clone());
+                    vec![]
+                } else {
+                    vec![g.get(name).and_then(|v| v.coerce(ty)).unwrap_or_else(|| Value::default_for(ty))]
+                }
+            }
             NodeKind::Add => vec![bin(BinOp::Add)?],
             NodeKind::Subtract => vec![bin(BinOp::Sub)?],
             NodeKind::Multiply => vec![bin(BinOp::Mul)?],
@@ -279,7 +620,7 @@ impl Ctx<'_> {
                 while left > 0 {
                     self.check_abort()?;
                     let step = left.min(10);
-                    std::thread::sleep(std::time::Duration::from_millis(step));
+                    std::thread::sleep(Duration::from_millis(step));
                     left -= step;
                 }
                 vec![]
@@ -329,7 +670,7 @@ impl Ctx<'_> {
                 vec![cluster]
             }
             NodeKind::UnbundleByName { names } => {
-                let src_ty = self.types.input(self.vi, id, 0).cloned();
+                let src_ty = self.types.input(self.vi, id, 0);
                 match (req(0)?, src_ty) {
                     (Value::Cluster(vals), Some(DataType::Cluster(fields))) => names
                         .iter()
@@ -355,6 +696,25 @@ impl Ctx<'_> {
             }
         })
     }
+}
+
+/// Does a Case frame label match the selector? Supports exact text, integers, `a..b` ranges and lists.
+fn label_matches(label: &str, key: &str, num: Option<i64>) -> bool {
+    let label = label.trim();
+    if label == key {
+        return true;
+    }
+    let Some(n) = num else { return false };
+    label.split(',').any(|part| {
+        let part = part.trim();
+        if let Some((lo, hi)) = part.split_once("..") {
+            let lo = lo.trim().parse::<i64>().unwrap_or(i64::MIN);
+            let hi = hi.trim().parse::<i64>().unwrap_or(i64::MAX);
+            (lo..=hi).contains(&n)
+        } else {
+            part.parse::<i64>() == Ok(n)
+        }
+    })
 }
 
 #[cfg(test)]

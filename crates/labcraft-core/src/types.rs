@@ -283,6 +283,7 @@ impl Value {
             (Value::Int(i), DataType::Num(k)) => Some(k.from_i64(*i)),
             (Value::Dbl(d), DataType::Num(k)) => Some(k.from_f64(*d)),
             (Value::Int(i), DataType::Enum(items)) => Some(Value::Int((*i).clamp(0, items.len().saturating_sub(1) as i64))),
+            (Value::Array(a), DataType::Array(..)) if a.data.is_empty() => Some(Value::default_for(to)),
             (Value::Array(a), DataType::Array(e, n)) if a.dims.len() == *n => {
                 let data = a.data.iter().map(|v| v.coerce(e)).collect::<Option<Vec<_>>>()?;
                 Some(Value::Array(ArrayVal { dims: a.dims.clone(), data }))
