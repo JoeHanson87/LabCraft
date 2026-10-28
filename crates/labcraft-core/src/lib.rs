@@ -5,6 +5,6 @@ pub mod eval;
 pub mod model;
 pub mod types;
 
-pub use eval::{run, RunError, RunResult};
-pub use model::{Command, Editor, EditError, Node, NodeId, NodeKind, Terminal, Vi, Wire};
+pub use eval::{run, run_with, RunControl, RunError, RunResult};
+pub use model::{Command, EditError, Editor, LoopKind, Node, NodeId, NodeKind, Terminal, Vi, Widget, Wire, LOOP_BORDER, NODE_W};
 pub use types::{DataType, Value};

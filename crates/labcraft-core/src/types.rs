@@ -6,12 +6,14 @@ pub enum DataType {
     Int,
     Bool,
     Str,
+    /// 1D array of doubles (also used as the waveform-graph data type).
+    ArrDbl,
 }
 
 impl DataType {
-    /// Whether a wire of type `self` may feed a terminal of type `to` (with coercion).
+    /// Whether a wire of type `self` may feed a terminal of type `to` (with a coercion dot).
     pub fn can_feed(self, to: DataType) -> bool {
-        self == to || (self == DataType::Int && to == DataType::Dbl)
+        self == to || matches!((self, to), (DataType::Int, DataType::Dbl) | (DataType::Dbl, DataType::Int))
     }
 }
 
@@ -21,6 +23,7 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     Str(String),
+    ArrDbl(Vec<f64>),
 }
 
 impl Value {
@@ -30,6 +33,7 @@ impl Value {
             Value::Int(_) => DataType::Int,
             Value::Bool(_) => DataType::Bool,
             Value::Str(_) => DataType::Str,
+            Value::ArrDbl(_) => DataType::ArrDbl,
         }
     }
     pub fn default_for(t: DataType) -> Value {
@@ -38,6 +42,7 @@ impl Value {
             DataType::Int => Value::Int(0),
             DataType::Bool => Value::Bool(false),
             DataType::Str => Value::Str(String::new()),
+            DataType::ArrDbl => Value::ArrDbl(vec![]),
         }
     }
     pub fn as_f64(&self) -> Option<f64> {
@@ -51,6 +56,7 @@ impl Value {
         match (self, to) {
             (v, t) if v.data_type() == t => Some(v.clone()),
             (Value::Int(i), DataType::Dbl) => Some(Value::Dbl(*i as f64)),
+            (Value::Dbl(d), DataType::Int) => Some(Value::Int(d.round() as i64)),
             _ => None,
         }
     }
@@ -63,6 +69,7 @@ impl std::fmt::Display for Value {
             Value::Int(v) => write!(f, "{v}"),
             Value::Bool(v) => write!(f, "{}", if *v { "TRUE" } else { "FALSE" }),
             Value::Str(v) => write!(f, "{v}"),
+            Value::ArrDbl(v) => write!(f, "[{} elements]", v.len()),
         }
     }
 }

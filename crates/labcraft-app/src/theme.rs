@@ -7,6 +7,8 @@ pub const GRID: Color32 = Color32::from_rgb(40, 43, 51);
 pub const ACCENT: Color32 = Color32::from_rgb(0, 190, 220);
 pub const NODE_FILL: Color32 = Color32::from_rgb(52, 56, 66);
 pub const NODE_STROKE: Color32 = Color32::from_rgb(110, 118, 135);
+pub const SUNKEN: Color32 = Color32::from_rgb(12, 13, 16);
+pub const ACCENT_TYPE: DataType = DataType::Int;
 pub const TEXT_DIM: Color32 = Color32::from_rgb(150, 156, 170);
 
 /// LabVIEW-style wire colours by data type.
@@ -16,6 +18,7 @@ pub fn type_color(t: DataType) -> Color32 {
         DataType::Int => Color32::from_rgb(70, 130, 255),
         DataType::Bool => Color32::from_rgb(60, 205, 95),
         DataType::Str => Color32::from_rgb(235, 105, 205),
+        DataType::ArrDbl => Color32::from_rgb(255, 170, 70),
     }
 }
 
