@@ -2,6 +2,7 @@ mod app;
 mod diagram;
 mod panel;
 mod theme;
+mod valedit;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

@@ -1,4 +1,5 @@
-use crate::types::{DataType, Value};
+use crate::typing;
+use crate::types::{DataType, NumKind, Value};
 use serde::{Deserialize, Serialize};
 
 pub type NodeId = u64;
@@ -30,26 +31,62 @@ pub enum Widget {
     StrInd,
     Chart,
     Graph,
+    EnumCtl,
+    EnumInd,
+    ArrayCtl,
+    ArrayInd,
+    ClusterCtl,
+    ClusterInd,
+}
+
+fn field_height(ty: &DataType) -> f32 {
+    match ty {
+        DataType::Cluster(f) => 30.0 + f.iter().map(|f| field_height(&f.ty)).sum::<f32>(),
+        DataType::Array(..) => 104.0,
+        _ => 28.0,
+    }
 }
 
 impl Widget {
     pub fn default_for(kind: &NodeKind) -> Widget {
-        match kind {
-            NodeKind::Control { ty, .. } => match ty {
-                DataType::Bool => Widget::Toggle,
-                DataType::Str => Widget::StrCtl,
-                _ => Widget::NumCtl,
-            },
-            NodeKind::Indicator { ty, .. } => match ty {
-                DataType::Bool => Widget::Led,
-                DataType::Str => Widget::StrInd,
-                DataType::ArrDbl => Widget::Graph,
-                _ => Widget::NumInd,
-            },
-            _ => Widget::NumCtl,
+        let (ty, ctl) = match kind {
+            NodeKind::Control { ty, .. } => (ty, true),
+            NodeKind::Indicator { ty, .. } => (ty, false),
+            _ => return Widget::NumCtl,
+        };
+        match (ty, ctl) {
+            (DataType::Bool, true) => Widget::Toggle,
+            (DataType::Bool, false) => Widget::Led,
+            (DataType::Str, true) => Widget::StrCtl,
+            (DataType::Str, false) => Widget::StrInd,
+            (DataType::Enum(_), true) => Widget::EnumCtl,
+            (DataType::Enum(_), false) => Widget::EnumInd,
+            (DataType::Array(..), true) => Widget::ArrayCtl,
+            (DataType::Array(..), false) => Widget::ArrayInd,
+            (DataType::Cluster(_), true) => Widget::ClusterCtl,
+            (DataType::Cluster(_), false) => Widget::ClusterInd,
+            (_, true) => Widget::NumCtl,
+            (_, false) => Widget::NumInd,
         }
     }
-    pub fn panel_size(self) -> [f32; 2] {
+
+    /// Whether this widget can display a value of type `ty`.
+    pub fn fits(self, ty: &DataType, is_ctl: bool) -> bool {
+        let n = |w: Widget| w == self;
+        match ty {
+            DataType::Num(_) => {
+                if is_ctl { n(Widget::NumCtl) || n(Widget::Knob) || n(Widget::Slide) } else { n(Widget::NumInd) || n(Widget::Gauge) || n(Widget::Thermometer) || n(Widget::Tank) || n(Widget::Chart) }
+            }
+            DataType::Bool => if is_ctl { n(Widget::Toggle) || n(Widget::PushButton) } else { n(Widget::Led) },
+            DataType::Str => if is_ctl { n(Widget::StrCtl) } else { n(Widget::StrInd) },
+            DataType::Enum(_) => if is_ctl { n(Widget::EnumCtl) } else { n(Widget::EnumInd) },
+            DataType::Array(e, 1) if matches!(**e, DataType::Num(_)) && !is_ctl => n(Widget::Graph) || n(Widget::ArrayInd),
+            DataType::Array(..) => if is_ctl { n(Widget::ArrayCtl) } else { n(Widget::ArrayInd) },
+            DataType::Cluster(_) => if is_ctl { n(Widget::ClusterCtl) } else { n(Widget::ClusterInd) },
+        }
+    }
+
+    pub fn panel_size(self, ty: &DataType) -> [f32; 2] {
         match self {
             Widget::NumCtl | Widget::NumInd => [170.0, 48.0],
             Widget::Knob => [130.0, 150.0],
@@ -61,7 +98,13 @@ impl Widget {
             Widget::PushButton => [120.0, 68.0],
             Widget::Led => [80.0, 80.0],
             Widget::StrCtl | Widget::StrInd => [210.0, 52.0],
+            Widget::EnumCtl | Widget::EnumInd => [170.0, 48.0],
             Widget::Chart | Widget::Graph => [360.0, 220.0],
+            Widget::ArrayCtl | Widget::ArrayInd => {
+                let dims = if let DataType::Array(_, n) = ty { *n } else { 1 };
+                [320.0, if dims > 1 { 168.0 } else { 118.0 }]
+            }
+            Widget::ClusterCtl | Widget::ClusterInd => [250.0, 22.0 + field_height(ty)],
         }
     }
     pub fn label(self) -> &'static str {
@@ -80,6 +123,12 @@ impl Widget {
             Widget::StrInd => "String Indicator",
             Widget::Chart => "Waveform Chart",
             Widget::Graph => "Waveform Graph",
+            Widget::EnumCtl => "Enum Control",
+            Widget::EnumInd => "Enum Indicator",
+            Widget::ArrayCtl => "Array Control",
+            Widget::ArrayInd => "Array Indicator",
+            Widget::ClusterCtl => "Cluster Control",
+            Widget::ClusterInd => "Cluster Indicator",
         }
     }
     pub fn is_numeric_scaled(self) -> bool {
@@ -93,41 +142,82 @@ pub enum NodeKind {
     Control { name: String, ty: DataType },
     /// Front-panel indicator; its terminal on the diagram is a data sink.
     Indicator { name: String, ty: DataType },
-    Constant(Value),
+    /// A diagram constant of the given type; its value lives on the node.
+    Constant(DataType),
     Add,
     Subtract,
     Multiply,
     Divide,
+    Increment,
+    Decrement,
+    Negate,
+    Absolute,
+    SquareRoot,
+    Convert(NumKind),
     And,
     Or,
+    Xor,
     Not,
     Greater,
     Less,
+    GreaterEq,
+    LessEq,
     Equal,
+    NotEq,
+    Select,
     Concatenate,
+    NumToString,
     Sine,
     Random,
     WaitMs,
     BuildArray,
     ArraySize,
     IndexArray,
+    InitializeArray,
+    Transpose,
+    Bundle { n: usize },
+    Unbundle { n: usize },
+    BundleByName { names: Vec<String> },
+    UnbundleByName { names: Vec<String> },
+    ErrorFromCode,
+    MergeErrors,
     /// A While or For loop structure with shift registers of the given types.
     Loop { kind: LoopKind, regs: Vec<DataType> },
+}
+
+/// What types a terminal accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spec {
+    /// Exactly `Terminal::ty`, with numeric coercion.
+    Exact,
+    /// Numeric scalar, or array/cluster of numerics (polymorphic).
+    NumLike,
+    /// Boolean scalar, or array/cluster of booleans (polymorphic).
+    BoolLike,
+    Any,
+    AnyArray,
+    AnyCluster,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Terminal {
     pub name: String,
+    /// Declared type; the default shown for polymorphic terminals before they are wired.
     pub ty: DataType,
+    pub spec: Spec,
     /// Terminal sits inside a structure's border (not on the outer side).
     pub inner: bool,
-    /// Unwired optional inputs take the type's default value.
+    /// Unwired optional inputs are allowed.
     pub optional: bool,
 }
 
 impl Terminal {
     fn new(name: &str, ty: DataType) -> Self {
-        Terminal { name: name.into(), ty, inner: false, optional: false }
+        Terminal { name: name.into(), ty, spec: Spec::Exact, inner: false, optional: false }
+    }
+    fn spec(mut self, s: Spec) -> Self {
+        self.spec = s;
+        self
     }
     fn inner(mut self) -> Self {
         self.inner = true;
@@ -148,19 +238,39 @@ impl NodeKind {
             NodeKind::Subtract => "Subtract".into(),
             NodeKind::Multiply => "Multiply".into(),
             NodeKind::Divide => "Divide".into(),
+            NodeKind::Increment => "Increment".into(),
+            NodeKind::Decrement => "Decrement".into(),
+            NodeKind::Negate => "Negate".into(),
+            NodeKind::Absolute => "Absolute Value".into(),
+            NodeKind::SquareRoot => "Square Root".into(),
+            NodeKind::Convert(k) => format!("To {}", k.label()),
             NodeKind::And => "And".into(),
             NodeKind::Or => "Or".into(),
+            NodeKind::Xor => "Exclusive Or".into(),
             NodeKind::Not => "Not".into(),
             NodeKind::Greater => "Greater?".into(),
             NodeKind::Less => "Less?".into(),
+            NodeKind::GreaterEq => "Greater Or Equal?".into(),
+            NodeKind::LessEq => "Less Or Equal?".into(),
             NodeKind::Equal => "Equal?".into(),
+            NodeKind::NotEq => "Not Equal?".into(),
+            NodeKind::Select => "Select".into(),
             NodeKind::Concatenate => "Concatenate Strings".into(),
+            NodeKind::NumToString => "Number To String".into(),
             NodeKind::Sine => "Sine".into(),
             NodeKind::Random => "Random Number".into(),
             NodeKind::WaitMs => "Wait (ms)".into(),
             NodeKind::BuildArray => "Build Array".into(),
             NodeKind::ArraySize => "Array Size".into(),
             NodeKind::IndexArray => "Index Array".into(),
+            NodeKind::InitializeArray => "Initialize Array".into(),
+            NodeKind::Transpose => "Transpose 2D Array".into(),
+            NodeKind::Bundle { .. } => "Bundle".into(),
+            NodeKind::Unbundle { .. } => "Unbundle".into(),
+            NodeKind::BundleByName { .. } => "Bundle By Name".into(),
+            NodeKind::UnbundleByName { .. } => "Unbundle By Name".into(),
+            NodeKind::ErrorFromCode => "Error From Code".into(),
+            NodeKind::MergeErrors => "Merge Errors".into(),
             NodeKind::Loop { kind: LoopKind::While, .. } => "While Loop".into(),
             NodeKind::Loop { kind: LoopKind::For, .. } => "For Loop".into(),
         }
@@ -168,61 +278,86 @@ impl NodeKind {
 
     /// Input terminals. For loops: `[N|stop, init0, next0, init1, next1, ...]`.
     pub fn inputs(&self) -> Vec<Terminal> {
-        use DataType::*;
+        use DataType as T;
+        use Spec::*;
         let t = Terminal::new;
+        let num2 = || vec![t("x", T::DBL).spec(NumLike), t("y", T::DBL).spec(NumLike)];
+        let num1 = || vec![t("x", T::DBL).spec(NumLike)];
         match self {
             NodeKind::Control { .. } | NodeKind::Constant(_) | NodeKind::Random => vec![],
-            NodeKind::Indicator { ty, .. } => vec![t("in", *ty)],
-            NodeKind::Add | NodeKind::Subtract | NodeKind::Multiply | NodeKind::Divide => {
-                vec![t("x", Dbl), t("y", Dbl)]
+            NodeKind::Indicator { ty, .. } => vec![t("in", ty.clone())],
+            NodeKind::Add | NodeKind::Subtract | NodeKind::Multiply | NodeKind::Divide => num2(),
+            NodeKind::Greater | NodeKind::Less | NodeKind::GreaterEq | NodeKind::LessEq => num2(),
+            NodeKind::Increment | NodeKind::Decrement | NodeKind::Negate | NodeKind::Absolute | NodeKind::SquareRoot | NodeKind::Convert(_) => num1(),
+            NodeKind::And | NodeKind::Or | NodeKind::Xor => vec![t("x", T::Bool).spec(BoolLike), t("y", T::Bool).spec(BoolLike)],
+            NodeKind::Not => vec![t("x", T::Bool).spec(BoolLike)],
+            NodeKind::Equal | NodeKind::NotEq => vec![t("x", T::DBL).spec(Any), t("y", T::DBL).spec(Any)],
+            NodeKind::Select => vec![t("s", T::Bool), t("true", T::DBL).spec(Any), t("false", T::DBL).spec(Any)],
+            NodeKind::Concatenate => vec![t("a", T::Str), t("b", T::Str)],
+            NodeKind::NumToString => vec![t("number", T::DBL)],
+            NodeKind::Sine => vec![t("x", T::DBL)],
+            NodeKind::WaitMs => vec![t("ms", T::I32)],
+            NodeKind::BuildArray => vec![t("array", T::arr_dbl()).spec(AnyArray).opt(), t("element", T::DBL).spec(Any)],
+            NodeKind::ArraySize | NodeKind::Transpose => vec![t("array", T::arr_dbl()).spec(AnyArray)],
+            NodeKind::IndexArray => vec![t("array", T::arr_dbl()).spec(AnyArray), t("index", T::I32), t("index 2", T::I32).opt()],
+            NodeKind::InitializeArray => vec![t("element", T::DBL).spec(Any), t("size", T::I32).opt()],
+            NodeKind::Bundle { n } => {
+                let mut v = vec![t("cluster", T::Cluster(vec![])).spec(AnyCluster).opt()];
+                v.extend((0..*n).map(|i| t(&format!("e{i}"), T::DBL).spec(Any).opt()));
+                v
             }
-            NodeKind::And | NodeKind::Or => vec![t("x", Bool), t("y", Bool)],
-            NodeKind::Not => vec![t("x", Bool)],
-            NodeKind::Greater | NodeKind::Less | NodeKind::Equal => vec![t("x", Dbl), t("y", Dbl)],
-            NodeKind::Concatenate => vec![t("a", Str), t("b", Str)],
-            NodeKind::Sine => vec![t("x", Dbl)],
-            NodeKind::WaitMs => vec![t("ms", Int)],
-            NodeKind::BuildArray => vec![t("array", ArrDbl).opt(), t("element", Dbl)],
-            NodeKind::ArraySize => vec![t("array", ArrDbl)],
-            NodeKind::IndexArray => vec![t("array", ArrDbl), t("index", Int)],
+            NodeKind::Unbundle { .. } => vec![t("cluster", T::Cluster(vec![])).spec(AnyCluster)],
+            NodeKind::BundleByName { names } => {
+                let mut v = vec![t("cluster", T::Cluster(vec![])).spec(AnyCluster)];
+                v.extend(names.iter().map(|n| t(if n.is_empty() { "?" } else { n }, T::DBL).spec(Any).opt()));
+                v
+            }
+            NodeKind::UnbundleByName { .. } => vec![t("cluster", T::Cluster(vec![])).spec(AnyCluster)],
+            NodeKind::ErrorFromCode => vec![t("code", T::I32), t("source", T::Str).opt()],
+            NodeKind::MergeErrors => vec![t("error 1", T::error_cluster()).opt(), t("error 2", T::error_cluster()).opt()],
             NodeKind::Loop { kind, regs } => {
                 let mut v = vec![match kind {
-                    LoopKind::For => t("N", Int),
-                    LoopKind::While => t("stop", Bool).inner(),
+                    LoopKind::For => t("N", T::I32),
+                    LoopKind::While => t("stop", T::Bool).inner(),
                 }];
                 for ty in regs {
-                    v.push(t("init", *ty).opt());
-                    v.push(t("next", *ty).inner().opt());
+                    v.push(t("init", ty.clone()).opt());
+                    v.push(t("next", ty.clone()).inner().opt());
                 }
                 v
             }
         }
     }
 
-    /// Output terminals. For loops: `[i, cur0, final0, cur1, final1, ...]`.
+    /// Declared output terminals (their real types are resolved by `typing`).
+    /// For loops: `[i, cur0, final0, cur1, final1, ...]`.
     pub fn outputs(&self) -> Vec<Terminal> {
-        use DataType::*;
+        use DataType as T;
         let t = Terminal::new;
         match self {
-            NodeKind::Control { ty, .. } => vec![t("out", *ty)],
+            NodeKind::Control { ty, .. } => vec![t("out", ty.clone())],
             NodeKind::Indicator { .. } | NodeKind::WaitMs => vec![],
-            NodeKind::Constant(v) => vec![t("out", v.data_type())],
-            NodeKind::Add | NodeKind::Subtract | NodeKind::Multiply | NodeKind::Divide => {
-                vec![t("result", Dbl)]
-            }
-            NodeKind::And | NodeKind::Or | NodeKind::Not => vec![t("result", Bool)],
-            NodeKind::Greater | NodeKind::Less | NodeKind::Equal => vec![t("result", Bool)],
-            NodeKind::Concatenate => vec![t("result", Str)],
-            NodeKind::Sine => vec![t("sin", Dbl)],
-            NodeKind::Random => vec![t("rand", Dbl)],
-            NodeKind::BuildArray => vec![t("result", ArrDbl)],
-            NodeKind::ArraySize => vec![t("size", Int)],
-            NodeKind::IndexArray => vec![t("element", Dbl)],
+            NodeKind::Constant(ty) => vec![t("out", ty.clone())],
+            NodeKind::Add | NodeKind::Subtract | NodeKind::Multiply | NodeKind::Divide => vec![t("result", T::DBL)],
+            NodeKind::Increment | NodeKind::Decrement | NodeKind::Negate | NodeKind::Absolute | NodeKind::SquareRoot | NodeKind::Convert(_) => vec![t("result", T::DBL)],
+            NodeKind::And | NodeKind::Or | NodeKind::Xor | NodeKind::Not => vec![t("result", T::Bool)],
+            NodeKind::Greater | NodeKind::Less | NodeKind::GreaterEq | NodeKind::LessEq | NodeKind::Equal | NodeKind::NotEq => vec![t("result", T::Bool)],
+            NodeKind::Select => vec![t("result", T::DBL)],
+            NodeKind::Concatenate | NodeKind::NumToString => vec![t("result", T::Str)],
+            NodeKind::Sine => vec![t("sin", T::DBL)],
+            NodeKind::Random => vec![t("rand", T::DBL)],
+            NodeKind::BuildArray | NodeKind::Transpose | NodeKind::InitializeArray => vec![t("result", T::arr_dbl())],
+            NodeKind::ArraySize => vec![t("size", T::I32)],
+            NodeKind::IndexArray => vec![t("element", T::DBL)],
+            NodeKind::Bundle { .. } | NodeKind::BundleByName { .. } => vec![t("cluster", T::Cluster(vec![]))],
+            NodeKind::Unbundle { n } => (0..*n).map(|i| t(&format!("{i}"), T::DBL)).collect(),
+            NodeKind::UnbundleByName { names } => names.iter().map(|n| t(if n.is_empty() { "?" } else { n }, T::DBL)).collect(),
+            NodeKind::ErrorFromCode | NodeKind::MergeErrors => vec![t("error out", T::error_cluster())],
             NodeKind::Loop { regs, .. } => {
-                let mut v = vec![t("i", Int).inner()];
+                let mut v = vec![t("i", T::I32).inner()];
                 for ty in regs {
-                    v.push(t("cur", *ty).inner());
-                    v.push(t("out", *ty));
+                    v.push(t("cur", ty.clone()).inner());
+                    v.push(t("out", ty.clone()));
                 }
                 v
             }
@@ -242,7 +377,11 @@ impl NodeKind {
             return [300.0, 200.0];
         }
         let rows = self.inputs().len().max(self.outputs().len()).max(1) as f32;
-        let h = if matches!(self, NodeKind::Constant(_)) { 62.0 } else { 28.0 + rows * 22.0 };
+        let h = match self {
+            NodeKind::Constant(DataType::Num(_) | DataType::Bool | DataType::Str | DataType::Enum(_)) => 62.0,
+            NodeKind::Constant(_) => 62.0,
+            _ => 28.0 + rows * 22.0,
+        };
         [NODE_W, h]
     }
 }
@@ -267,6 +406,17 @@ pub struct Node {
 }
 
 impl Node {
+    pub fn data_type(&self) -> Option<&DataType> {
+        match &self.kind {
+            NodeKind::Control { ty, .. } | NodeKind::Indicator { ty, .. } | NodeKind::Constant(ty) => Some(ty),
+            _ => None,
+        }
+    }
+
+    pub fn panel_size(&self) -> [f32; 2] {
+        self.widget.panel_size(self.data_type().unwrap_or(&DataType::DBL))
+    }
+
     pub fn loop_reg_y(&self, k: usize) -> f32 {
         self.pos[1] + 52.0 + 30.0 * k as f32
     }
@@ -383,7 +533,7 @@ impl Vi {
             .nodes
             .iter()
             .filter(|n| n.kind.is_panel_item())
-            .map(|n| (n.id, n.panel_pos, n.widget.panel_size()))
+            .map(|n| (n.id, n.panel_pos, n.panel_size()))
             .collect();
         let mut y = 20.0;
         while y < 4000.0 {
@@ -409,8 +559,12 @@ pub enum EditError {
     NoNode(NodeId),
     #[error("node {0} has no such terminal {1}")]
     NoTerminal(NodeId, usize),
-    #[error("type mismatch: {0:?} cannot feed {1:?}")]
+    #[error("type mismatch: {} cannot feed {}", .0.label(), .1.label())]
     TypeMismatch(DataType, DataType),
+    #[error("node {0} cannot be edited this way")]
+    WrongNodeKind(NodeId),
+    #[error("cluster has no element named '{0}'")]
+    NoSuchField(String),
     #[error("connection would create a cycle")]
     Cycle,
     #[error("a structure's inner terminal can only feed nodes inside that structure")]
@@ -439,6 +593,12 @@ pub enum Command {
     SetWidget { id: NodeId, widget: Widget },
     SetRange { id: NodeId, range: [f64; 2] },
     SetParent { id: NodeId, parent: Option<NodeId> },
+    /// Change the data type of a control, indicator or constant.
+    SetType { id: NodeId, ty: DataType },
+    /// Resize Bundle / Unbundle / (By Name) nodes.
+    SetElementCount { id: NodeId, n: usize },
+    /// Choose the element names of the By Name nodes.
+    SetNames { id: NodeId, names: Vec<String> },
     AddShiftRegister { id: NodeId, ty: DataType },
     RemoveShiftRegister { id: NodeId },
     /// Re-evaluates which structure a node sits in after a drag.
@@ -472,6 +632,7 @@ impl Editor {
         let key = match &cmd {
             Command::MoveNode { id, .. } => Some((0, *id)),
             Command::MovePanelItem { id, .. } => Some((1, *id)),
+            Command::SetType { id, .. } => Some((3, *id)),
             Command::Resize { id, .. } => Some((2, *id)),
             _ => None,
         };
@@ -512,13 +673,13 @@ impl Editor {
                 let widget = widget.unwrap_or_else(|| Widget::default_for(&kind));
                 let value = match &kind {
                     NodeKind::Control { ty, .. } | NodeKind::Indicator { ty, .. } => {
-                        if widget == Widget::Chart { Some(Value::ArrDbl(vec![])) } else { Some(Value::default_for(*ty)) }
+                        if widget == Widget::Chart { Some(Value::default_for(&DataType::arr_dbl())) } else { Some(Value::default_for(ty)) }
                     }
-                    NodeKind::Constant(v) => Some(v.clone()),
+                    NodeKind::Constant(ty) => Some(Value::default_for(ty)),
                     _ => None,
                 };
                 let size = kind.default_size();
-                let panel_pos = if kind.is_panel_item() { vi.free_panel_spot(widget.panel_size()) } else { [0.0, 0.0] };
+                let panel_pos = if kind.is_panel_item() { vi.free_panel_spot(widget.panel_size(match &kind { NodeKind::Control { ty, .. } | NodeKind::Indicator { ty, .. } => ty, _ => &DataType::DBL })) } else { [0.0, 0.0] };
                 let parent = if kind.is_loop() { None } else { vi.container_at([pos[0] + size[0] / 2.0, pos[1] + size[1] / 2.0], None) };
                 vi.nodes.push(Node { id, kind, pos, size, panel_pos, widget, range: [0.0, 10.0], parent, value });
                 Ok(Some(id))
@@ -561,17 +722,38 @@ impl Editor {
                 let dst = vi.node(to.0).ok_or(EditError::NoNode(to.0))?;
                 let st = src.kind.outputs().get(from.1).cloned().ok_or(EditError::NoTerminal(from.0, from.1))?;
                 let dt = dst.kind.inputs().get(to.1).cloned().ok_or(EditError::NoTerminal(to.0, to.1))?;
-                if !st.ty.can_feed(dt.ty) {
-                    return Err(EditError::TypeMismatch(st.ty, dt.ty));
-                }
                 if st.inner && !(vi.is_descendant(to.0, from.0) || (to.0 == from.0 && dt.inner)) {
                     return Err(EditError::Scope);
                 }
                 if !st.inner && !dt.inner && (from.0 == to.0 || reaches(vi, to.0, from.0)) {
                     return Err(EditError::Cycle);
                 }
+                // Wiring an untouched shift register's init terminal gives it the source's type.
+                if let (NodeKind::Loop { .. }, true) = (&dst.kind, to.1 >= 1 && to.1 % 2 == 1) {
+                    let k = (to.1 - 1) / 2;
+                    let untouched = !vi.wires.iter().any(|w| (w.to.0 == to.0 && w.to.1 == to.1 + 1) || (w.from.0 == to.0 && (w.from.1 == to.1 + 1 || w.from.1 == to.1 + 2)));
+                    if untouched {
+                        if let Some(ty) = typing::out_type(vi, from) {
+                            if let NodeKind::Loop { regs, .. } = &mut vi.node_mut(to.0).unwrap().kind {
+                                regs[k] = ty;
+                            }
+                        }
+                    }
+                }
+                typing::check_connect(vi, from, to)?;
                 vi.wires.retain(|w| w.to != to);
                 vi.wires.push(Wire { from, to });
+                // Bundle/Unbundle size themselves to the cluster that is wired in.
+                if to.1 == 0 {
+                    if let Some(DataType::Cluster(fields)) = typing::out_type(vi, from) {
+                        match &mut vi.node_mut(to.0).unwrap().kind {
+                            NodeKind::Unbundle { n } | NodeKind::Bundle { n } => *n = fields.len(),
+                            _ => {}
+                        }
+                        refresh_size(vi, to.0);
+                    }
+                }
+                prune_invalid_wires(vi);
                 Ok(None)
             }
             Command::Disconnect { to } => {
@@ -601,6 +783,45 @@ impl Editor {
                     }
                 }
                 vi.node_mut(id).unwrap().parent = parent;
+                Ok(None)
+            }
+            Command::SetType { id, ty } => {
+                let n = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
+                let is_ctl = matches!(n.kind, NodeKind::Control { .. });
+                match &mut n.kind {
+                    NodeKind::Control { ty: t, .. } | NodeKind::Indicator { ty: t, .. } | NodeKind::Constant(t) => *t = ty.clone(),
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                if n.widget != Widget::Chart {
+                    n.value = Some(n.value.as_ref().and_then(|v| v.coerce(&ty)).unwrap_or_else(|| Value::default_for(&ty)));
+                    if !n.widget.fits(&ty, is_ctl) && !matches!(n.kind, NodeKind::Constant(_)) {
+                        n.widget = Widget::default_for(&n.kind);
+                    }
+                }
+                refresh_size(vi, id);
+                prune_invalid_wires(vi);
+                Ok(None)
+            }
+            Command::SetElementCount { id, n } => {
+                let node = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
+                match &mut node.kind {
+                    NodeKind::Bundle { n: c } | NodeKind::Unbundle { n: c } => *c = n,
+                    NodeKind::BundleByName { names } | NodeKind::UnbundleByName { names } => names.resize(n, String::new()),
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                let is_bundle = matches!(node.kind, NodeKind::Bundle { .. } | NodeKind::BundleByName { .. });
+                refresh_size(vi, id);
+                vi.wires.retain(|w| !(w.to.0 == id && is_bundle && w.to.1 > n) && !(w.from.0 == id && !is_bundle && w.from.1 >= n));
+                Ok(None)
+            }
+            Command::SetNames { id, names } => {
+                let node = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
+                match &mut node.kind {
+                    NodeKind::BundleByName { names: n } | NodeKind::UnbundleByName { names: n } => *n = names,
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                refresh_size(vi, id);
+                prune_invalid_wires(vi);
                 Ok(None)
             }
             Command::AddShiftRegister { id, ty } => {
@@ -667,4 +888,25 @@ fn reaches(vi: &Vi, start: NodeId, target: NodeId) -> bool {
         }
     }
     false
+}
+
+fn refresh_size(vi: &mut Vi, id: NodeId) {
+    if let Some(n) = vi.node_mut(id) {
+        if !n.kind.is_loop() {
+            n.size = n.kind.default_size();
+        }
+    }
+}
+
+/// Drops wires that no longer type-check after an upstream type change.
+fn prune_invalid_wires(vi: &mut Vi) {
+    loop {
+        let bad = vi.wires.iter().position(|w| typing::check_connect(vi, w.from, w.to).is_err());
+        match bad {
+            Some(i) => {
+                vi.wires.remove(i);
+            }
+            None => break,
+        }
+    }
 }

@@ -1,7 +1,14 @@
 use crate::app::LabCraft;
 use crate::theme;
+use crate::valedit;
 use eframe::egui::{self, epaint::Shape, Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2};
 use labcraft_core::{Command, DataType, Node, NodeKind, Value, Widget};
+
+const SWAPPABLE: [Widget; 18] = [
+    Widget::NumCtl, Widget::Knob, Widget::Slide, Widget::NumInd, Widget::Gauge, Widget::Thermometer, Widget::Tank,
+    Widget::Toggle, Widget::PushButton, Widget::Led, Widget::StrCtl, Widget::StrInd, Widget::EnumCtl, Widget::EnumInd,
+    Widget::Graph, Widget::ArrayInd, Widget::ArrayCtl, Widget::ClusterCtl,
+];
 
 fn v2(p: [f32; 2]) -> Vec2 {
     Vec2::new(p[0], p[1])
@@ -65,12 +72,12 @@ pub fn show(app: &mut LabCraft, ui: &mut Ui) {
     let items: Vec<&Node> = nodes.iter().filter(|n| n.kind.is_panel_item()).collect();
     for n in &items {
         let (name, ty, is_ctl) = match &n.kind {
-            NodeKind::Control { name, ty } => (name, *ty, true),
-            NodeKind::Indicator { name, ty } => (name, *ty, false),
+            NodeKind::Control { name, ty } => (name, ty.clone(), true),
+            NodeKind::Indicator { name, ty } => (name, ty.clone(), false),
             _ => continue,
         };
-        let col = theme::type_color(ty);
-        let size = v2(n.widget.panel_size());
+        let col = theme::type_color(&ty);
+        let size = v2(n.panel_size());
         let r = Rect::from_min_size(origin + v2(n.panel_pos), size);
         if app.selected == Some(n.id) {
             painter.rect_stroke(r.expand(4.0), 3.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Outside);
@@ -88,12 +95,12 @@ pub fn show(app: &mut LabCraft, ui: &mut Ui) {
         if g.drag_stopped() {
             app.pending.push(Command::EndGesture);
         }
-        g.context_menu(|ui| item_menu(app, ui, n, ty, is_ctl));
+        g.context_menu(|ui| item_menu(app, ui, n, &ty, is_ctl));
         painter.text(r.min + Vec2::new(2.0, 8.0), Align2::LEFT_CENTER, name, FontId::proportional(11.5), Color32::from_gray(190));
 
         let body = Rect::from_min_max(r.min + Vec2::new(0.0, 18.0), r.max);
         let id = ui.scope_id().with(("w", n.id));
-        let value = n.value.clone().unwrap_or(Value::default_for(ty));
+        let value = n.value.clone().unwrap_or(Value::default_for(&ty));
         let range = n.range;
         let new = match n.widget {
             Widget::NumCtl => num_ctl(ui, &painter, id, body, &value, col),
@@ -131,9 +138,41 @@ pub fn show(app: &mut LabCraft, ui: &mut Ui) {
                 None
             }
             Widget::Chart | Widget::Graph => {
-                let data: &[f64] = if let Value::ArrDbl(v) = &value { v } else { &[] };
-                plot(&painter, body, data, n.widget == Widget::Chart);
+                plot(&painter, body, &value.to_f64_vec(), n.widget == Widget::Chart);
                 None
+            }
+            Widget::EnumCtl | Widget::EnumInd => {
+                let r = Rect::from_min_size(body.min, Vec2::new(body.width(), 26.0));
+                let (DataType::Enum(items), Value::Int(i)) = (&ty, &value) else { continue };
+                if is_ctl {
+                    sunken(&painter, r);
+                    let mut idx = *i;
+                    ui.scope_builder(UiBuilder::new().max_rect(r.shrink(1.0)).id_salt(("enum", n.id)), |ui| {
+                        egui::ComboBox::from_id_salt(("enumcb", n.id)).width(r.width() - 10.0).selected_text(items.get(idx as usize).cloned().unwrap_or_default()).show_ui(ui, |ui| {
+                            for (k, it) in items.iter().enumerate() {
+                                ui.selectable_value(&mut idx, k as i64, it);
+                            }
+                        });
+                    });
+                    (idx != *i).then(|| Value::Int(idx))
+                } else {
+                    sunken(&painter, r);
+                    painter.text(r.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, items.get(*i as usize).cloned().unwrap_or_default(), FontId::proportional(13.0), col);
+                    None
+                }
+            }
+            Widget::ArrayCtl | Widget::ArrayInd | Widget::ClusterCtl | Widget::ClusterInd => {
+                let frame = body.shrink2(Vec2::new(0.0, 0.0));
+                painter.rect_filled(frame, 3.0, Color32::from_rgb(26, 28, 34));
+                painter.rect_stroke(frame, 3.0, Stroke::new(1.5, col.linear_multiply(0.7)), StrokeKind::Inside);
+                let mut v = value.clone();
+                let changed = ui
+                    .scope_builder(UiBuilder::new().max_rect(frame.shrink(6.0)).id_salt(("val", n.id)), |ui| {
+                        ui.set_clip_rect(frame.shrink(1.0));
+                        valedit::edit_value(ui, &ty, &mut v, is_ctl)
+                    })
+                    .inner;
+                changed.then_some(v)
             }
         };
         if let Some(v) = new {
@@ -145,24 +184,23 @@ pub fn show(app: &mut LabCraft, ui: &mut Ui) {
     }
 }
 
-fn item_menu(app: &mut LabCraft, ui: &mut Ui, n: &Node, ty: DataType, is_ctl: bool) {
-    let options: &[Widget] = match (is_ctl, ty) {
-        (true, DataType::Bool) => &[Widget::Toggle, Widget::PushButton],
-        (true, DataType::Str) => &[Widget::StrCtl],
-        (true, _) => &[Widget::NumCtl, Widget::Knob, Widget::Slide],
-        (false, DataType::Bool) => &[Widget::Led],
-        (false, DataType::Str) => &[Widget::StrInd],
-        (false, DataType::ArrDbl) => &[Widget::Graph],
-        (false, _) if n.widget == Widget::Chart => &[Widget::Chart],
-        (false, _) => &[Widget::NumInd, Widget::Gauge, Widget::Thermometer, Widget::Tank],
-    };
+fn item_menu(app: &mut LabCraft, ui: &mut Ui, n: &Node, ty: &DataType, is_ctl: bool) {
+    let options: Vec<Widget> = SWAPPABLE.iter().copied().filter(|w| w.fits(ty, is_ctl) && !matches!(w, Widget::Graph if n.widget == Widget::Chart)).collect();
     if options.len() > 1 {
         ui.menu_button("Replace with", |ui| {
-            for w in options {
+            for w in &options {
                 if ui.selectable_label(n.widget == *w, w.label()).clicked() {
                     app.pending.push(Command::SetWidget { id: n.id, widget: *w });
                     ui.close();
                 }
+            }
+        });
+    }
+    if n.widget != Widget::Chart {
+        let mut t = ty.clone();
+        ui.menu_button(format!("Data type: {}", ty.label()), |ui| {
+            if valedit::type_menu(ui, &mut t) {
+                app.pending.push(Command::SetType { id: n.id, ty: t.clone() });
             }
         });
     }
@@ -358,7 +396,7 @@ fn toggle(ui: &mut Ui, p: &Painter, id: egui::Id, body: Rect, on: bool) -> Optio
     let x = if on { r.right() - 14.0 } else { r.left() + 14.0 };
     p.circle_filled(Pos2::new(x, r.center().y), 11.0, Color32::from_gray(205));
     p.circle_filled(Pos2::new(x - 2.0, r.center().y - 2.0), 5.0, Color32::from_white_alpha(70));
-    p.text(Pos2::new(r.center().x, r.bottom() + 9.0), Align2::CENTER_CENTER, if on { "ON" } else { "OFF" }, FontId::monospace(10.0), theme::type_color(DataType::Bool));
+    p.text(Pos2::new(r.center().x, r.bottom() + 9.0), Align2::CENTER_CENTER, if on { "ON" } else { "OFF" }, FontId::monospace(10.0), theme::type_color(&DataType::Bool));
     ui.interact(r, id, Sense::click()).clicked().then(|| Value::Bool(!on))
 }
 
@@ -394,7 +432,7 @@ fn str_ctl(ui: &mut Ui, p: &Painter, body: Rect, value: &Value) -> Option<Value>
             let vis = ui.visuals_mut();
             vis.widgets.inactive.bg_fill = Color32::TRANSPARENT;
             vis.extreme_bg_color = Color32::TRANSPARENT;
-            ui.add(egui::TextEdit::singleline(&mut s).frame(egui::Frame::NONE).desired_width(r.width() - 8.0).text_color(theme::type_color(DataType::Str))).changed()
+            ui.add(egui::TextEdit::singleline(&mut s).frame(egui::Frame::NONE).desired_width(r.width() - 8.0).text_color(theme::type_color(&DataType::Str))).changed()
         })
         .inner;
     changed.then(|| Value::Str(s))

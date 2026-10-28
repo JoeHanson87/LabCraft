@@ -8,17 +8,28 @@ pub const ACCENT: Color32 = Color32::from_rgb(0, 190, 220);
 pub const NODE_FILL: Color32 = Color32::from_rgb(52, 56, 66);
 pub const NODE_STROKE: Color32 = Color32::from_rgb(110, 118, 135);
 pub const SUNKEN: Color32 = Color32::from_rgb(12, 13, 16);
-pub const ACCENT_TYPE: DataType = DataType::Int;
 pub const TEXT_DIM: Color32 = Color32::from_rgb(150, 156, 170);
 
-/// LabVIEW-style wire colours by data type.
-pub fn type_color(t: DataType) -> Color32 {
+/// LabVIEW-style wire colours: blue integers, orange floats, green booleans, pink strings.
+pub fn type_color(t: &DataType) -> Color32 {
     match t {
-        DataType::Dbl => Color32::from_rgb(255, 140, 30),
-        DataType::Int => Color32::from_rgb(70, 130, 255),
+        DataType::Num(k) if k.is_float() => Color32::from_rgb(255, 140, 30),
+        DataType::Num(_) => Color32::from_rgb(70, 130, 255),
         DataType::Bool => Color32::from_rgb(60, 205, 95),
         DataType::Str => Color32::from_rgb(235, 105, 205),
-        DataType::ArrDbl => Color32::from_rgb(255, 170, 70),
+        DataType::Enum(_) => Color32::from_rgb(60, 170, 200),
+        DataType::Array(e, _) => type_color(e),
+        DataType::Cluster(_) if t.is_error_cluster() => Color32::from_rgb(225, 195, 60),
+        DataType::Cluster(_) => Color32::from_rgb(200, 140, 80),
+    }
+}
+
+/// Wire thickness: scalars thin, arrays thick, clusters thick with a dark core.
+pub fn wire_width(t: &DataType) -> f32 {
+    match t {
+        DataType::Array(_, n) => 3.0 + *n as f32,
+        DataType::Cluster(_) => 4.5,
+        _ => 2.2,
     }
 }
 
