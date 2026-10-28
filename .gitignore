@@ -1,2 +1,4 @@
 target/
 .DS_Store
+# VIs saved from the app while testing (use examples/ for committed samples)
+/*.vi.json
