@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lc-model",
+    "crates/lc-nodes",
+    "crates/lc-runtime",
+    "crates/lc-layout",
+    "crates/lc-dsl",
+    "crates/lc-theme",
+    "crates/lc-render",
+    "crates/lc-mcp",
+    "crates/lc-editor",
+    "crates/lc-cli",
+]
+default-members = ["crates/lc-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["LabCraft contributors"]
+repository = "https://github.com/joehanson/LabCraft"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+thiserror = "2"
+ulid = "1"
+tracing = "0.1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
