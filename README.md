@@ -4,6 +4,16 @@ A ground-up, native **Rust** clone of National Instruments LabVIEW, built so tha
 
 > **Status: early but real.** The dataflow language, type system, structures and a dark-themed editor all work. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for what exists and what is next.
 
+## Screenshots
+
+**Front panel** — graphs, heat map, table, listbox, decorations (Front Panel Showcase example)
+
+![LabCRAFT front panel](docs/Screenshot1.png)
+
+**Block diagram** — typed wires, For/While loops with auto-indexing tunnels (Loops and Graphs example)
+
+![LabCRAFT block diagram](docs/Screenshot2.png)
+
 ## Why another LabVIEW?
 
 LabVIEW VIs are opaque binary files edited only with a mouse, which is hostile to automation. LabCRAFT inverts that:
