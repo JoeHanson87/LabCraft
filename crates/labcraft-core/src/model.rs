@@ -1,3 +1,4 @@
+use crate::panel::{arrange_rects, Arrange, DecoKind, GraphConfig, Prop};
 use crate::typing;
 use crate::types::{DataType, NumKind, Value};
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,20 @@ pub enum Widget {
     ArrayInd,
     ClusterCtl,
     ClusterInd,
+    XyGraph,
+    IntensityGraph,
+    Table,
+    ListBox,
+    Decoration,
+}
+
+/// Initial value of a chart indicator's history: a growing array of samples
+/// (one row per sample, one column per plot for a multi-plot chart).
+pub fn chart_default(ty: &DataType) -> Value {
+    match ty {
+        DataType::Cluster(_) => Value::default_for(&DataType::array(DataType::DBL, 2)),
+        _ => Value::default_for(&DataType::arr_dbl()),
+    }
 }
 
 fn field_height(ty: &DataType) -> f32 {
@@ -63,6 +78,7 @@ impl Widget {
         let (ty, ctl) = match kind {
             NodeKind::Control { ty, .. } => (ty, true),
             NodeKind::Indicator { ty, .. } => (ty, false),
+            NodeKind::Decoration { .. } => return Widget::Decoration,
             _ => return Widget::NumCtl,
         };
         match (ty, ctl) {
@@ -91,10 +107,28 @@ impl Widget {
             DataType::Bool => if is_ctl { n(Widget::Toggle) || n(Widget::PushButton) } else { n(Widget::Led) },
             DataType::Str => if is_ctl { n(Widget::StrCtl) } else { n(Widget::StrInd) },
             DataType::Enum(_) => if is_ctl { n(Widget::EnumCtl) } else { n(Widget::EnumInd) },
+            DataType::Array(e, 1) if matches!(**e, DataType::Str) => n(Widget::ListBox) || if is_ctl { n(Widget::ArrayCtl) } else { n(Widget::ArrayInd) },
             DataType::Array(e, 1) if matches!(**e, DataType::Num(_)) && !is_ctl => n(Widget::Graph) || n(Widget::ArrayInd),
+            DataType::Array(e, 2) if matches!(**e, DataType::Num(_)) => {
+                if is_ctl { n(Widget::ArrayCtl) || n(Widget::Table) } else { n(Widget::ArrayInd) || n(Widget::Graph) || n(Widget::IntensityGraph) || n(Widget::Table) }
+            }
+            DataType::Array(e, 2) if matches!(**e, DataType::Str) => n(Widget::Table) || if is_ctl { n(Widget::ArrayCtl) } else { n(Widget::ArrayInd) },
             DataType::Array(..) => if is_ctl { n(Widget::ArrayCtl) } else { n(Widget::ArrayInd) },
+            DataType::Cluster(_) if !is_ctl && ty.is_waveform() => n(Widget::Graph) || n(Widget::ClusterInd),
+            DataType::Cluster(_) if !is_ctl && ty.is_xy() => n(Widget::XyGraph) || n(Widget::ClusterInd),
+            DataType::Cluster(_) if !is_ctl && ty.is_multi_chart() => n(Widget::Chart) || n(Widget::ClusterInd),
             DataType::Cluster(_) => if is_ctl { n(Widget::ClusterCtl) } else { n(Widget::ClusterInd) },
         }
+    }
+
+    /// Whether the user can drag-resize this widget on the panel.
+    pub fn resizable(self) -> bool {
+        matches!(
+            self,
+            Widget::NumCtl | Widget::NumInd | Widget::Slide | Widget::StrCtl | Widget::StrInd | Widget::EnumCtl | Widget::EnumInd
+                | Widget::Tank | Widget::Thermometer | Widget::Chart | Widget::Graph | Widget::XyGraph | Widget::IntensityGraph
+                | Widget::ArrayCtl | Widget::ArrayInd | Widget::Table | Widget::ListBox | Widget::Decoration
+        )
     }
 
     pub fn panel_size(self, ty: &DataType) -> [f32; 2] {
@@ -110,7 +144,11 @@ impl Widget {
             Widget::Led => [80.0, 80.0],
             Widget::StrCtl | Widget::StrInd => [210.0, 52.0],
             Widget::EnumCtl | Widget::EnumInd => [170.0, 48.0],
-            Widget::Chart | Widget::Graph => [360.0, 220.0],
+            Widget::Chart | Widget::Graph | Widget::XyGraph => [360.0, 220.0],
+            Widget::IntensityGraph => [330.0, 240.0],
+            Widget::Table => [360.0, 200.0],
+            Widget::ListBox => [200.0, 170.0],
+            Widget::Decoration => [160.0, 100.0],
             Widget::ArrayCtl | Widget::ArrayInd => {
                 let dims = if let DataType::Array(_, n) = ty { *n } else { 1 };
                 [320.0, if dims > 1 { 168.0 } else { 118.0 }]
@@ -134,6 +172,11 @@ impl Widget {
             Widget::StrInd => "String Indicator",
             Widget::Chart => "Waveform Chart",
             Widget::Graph => "Waveform Graph",
+            Widget::XyGraph => "XY Graph",
+            Widget::IntensityGraph => "Intensity Graph",
+            Widget::Table => "Table",
+            Widget::ListBox => "Listbox",
+            Widget::Decoration => "Decoration",
             Widget::EnumCtl => "Enum Control",
             Widget::EnumInd => "Enum Indicator",
             Widget::ArrayCtl => "Array Control",
@@ -206,6 +249,12 @@ pub enum NodeKind {
     Local { target: Option<NodeId>, ty: DataType, write: bool },
     /// Named variable shared across the whole VI (and across runs).
     Global { name: String, ty: DataType, write: bool },
+    /// Panel-only shape or label; never appears on the diagram.
+    Decoration { deco: DecoKind, text: String, color: [u8; 3] },
+    /// Reads or writes a property (Visible, Disabled, Caption) of a panel item.
+    Property { target: Option<NodeId>, prop: Prop, write: bool },
+    BuildWaveform,
+    GetWaveform,
 }
 
 /// What types a terminal accepts.
@@ -299,6 +348,10 @@ impl NodeKind {
             NodeKind::Sequence { .. } => "Flat Sequence".into(),
             NodeKind::Event { .. } => "Event Structure".into(),
             NodeKind::Feedback { .. } => "Feedback Node".into(),
+            NodeKind::Decoration { text, deco, .. } => if text.is_empty() { format!("{deco:?}") } else { text.clone() },
+            NodeKind::Property { prop, write, .. } => format!("Property: {}{}", prop.label(), if *write { " (write)" } else { "" }),
+            NodeKind::BuildWaveform => "Build Waveform".into(),
+            NodeKind::GetWaveform => "Get Waveform Components".into(),
             NodeKind::Local { write: true, .. } => "Local Variable (write)".into(),
             NodeKind::Local { .. } => "Local Variable".into(),
             NodeKind::Global { name, write, .. } => format!("{name}{}", if *write { " (write)" } else { "" }),
@@ -370,6 +423,11 @@ impl NodeKind {
             NodeKind::Feedback { ty } => vec![t("in", ty.clone()), t("init", ty.clone()).opt()],
             NodeKind::Local { ty, write: true, .. } | NodeKind::Global { ty, write: true, .. } => vec![t("in", ty.clone())],
             NodeKind::Local { .. } | NodeKind::Global { .. } => vec![],
+            NodeKind::Decoration { .. } => vec![],
+            NodeKind::Property { prop, write: true, .. } => vec![t("value", prop.ty())],
+            NodeKind::Property { .. } => vec![],
+            NodeKind::BuildWaveform => vec![t("t0", T::DBL).opt(), t("dt", T::DBL).opt(), t("Y", T::arr_dbl())],
+            NodeKind::GetWaveform => vec![t("waveform", T::waveform())],
             NodeKind::Loop { kind, regs } => {
                 let mut v = vec![match kind {
                     LoopKind::For => t("N", T::I32),
@@ -423,6 +481,11 @@ impl NodeKind {
             NodeKind::Feedback { ty } => vec![t("out", ty.clone())],
             NodeKind::Local { ty, write: false, .. } | NodeKind::Global { ty, write: false, .. } => vec![t("value", ty.clone())],
             NodeKind::Local { .. } | NodeKind::Global { .. } => vec![],
+            NodeKind::Decoration { .. } => vec![],
+            NodeKind::Property { prop, write: false, .. } => vec![t("value", prop.ty())],
+            NodeKind::Property { .. } => vec![],
+            NodeKind::BuildWaveform => vec![t("waveform", T::waveform())],
+            NodeKind::GetWaveform => vec![t("t0", T::DBL), t("dt", T::DBL), t("Y", T::arr_dbl())],
             NodeKind::Loop { regs, .. } => {
                 let mut v = vec![t("i", T::I32).inner()];
                 for ty in regs {
@@ -436,6 +499,10 @@ impl NodeKind {
 
     pub fn is_panel_item(&self) -> bool {
         matches!(self, NodeKind::Control { .. } | NodeKind::Indicator { .. })
+    }
+
+    pub fn is_decoration(&self) -> bool {
+        matches!(self, NodeKind::Decoration { .. })
     }
 
     pub fn is_loop(&self) -> bool {
@@ -543,6 +610,23 @@ pub struct Node {
     pub frame_view: usize,
     /// Current value for controls (user input), indicators (last result) and constants.
     pub value: Option<Value>,
+    /// User-chosen panel size (resizable widgets and decorations).
+    #[serde(default)]
+    pub panel_size_override: Option<[f32; 2]>,
+    /// Graph axes/legend/cursors (graph widgets).
+    #[serde(default)]
+    pub graph: GraphConfig,
+    #[serde(default = "yes")]
+    pub visible: bool,
+    #[serde(default)]
+    pub disabled: bool,
+    /// Replaces the control's label on the panel.
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Node {
@@ -554,7 +638,11 @@ impl Node {
     }
 
     pub fn panel_size(&self) -> [f32; 2] {
-        self.widget.panel_size(self.data_type().unwrap_or(&DataType::DBL))
+        if let NodeKind::Decoration { deco, .. } = &self.kind {
+            return self.panel_size_override.unwrap_or(deco.default_size());
+        }
+        let base = self.widget.panel_size(self.data_type().unwrap_or(&DataType::DBL));
+        if self.widget.resizable() { self.panel_size_override.unwrap_or(base) } else { base }
     }
 
     pub fn loop_reg_y(&self, k: usize) -> f32 {
@@ -855,6 +943,21 @@ pub enum Command {
     SetNames { id: NodeId, names: Vec<String> },
     AddShiftRegister { id: NodeId, ty: DataType },
     RemoveShiftRegister { id: NodeId },
+    /// Move several panel items at once (one undo step for a drag of a multi-selection).
+    MovePanelItems { moves: Vec<(NodeId, [f32; 2])> },
+    /// Round panel item positions to a grid.
+    SnapPanel { ids: Vec<NodeId>, grid: f32 },
+    /// Resize a panel item (resizable widgets and decorations).
+    ResizePanelItem { id: NodeId, size: [f32; 2] },
+    /// Graph axes, legend and cursors (a view setting; not undoable).
+    SetGraphConfig { id: NodeId, cfg: GraphConfig },
+    /// Visible / Disabled / caption of a panel item.
+    SetItemProps { id: NodeId, visible: Option<bool>, disabled: Option<bool>, caption: Option<Option<String>> },
+    SetDecoration { id: NodeId, text: Option<String>, color: Option<[u8; 3]> },
+    /// Align / distribute / resize / reorder panel items as one undoable step.
+    ArrangePanel { ids: Vec<NodeId>, op: Arrange },
+    SetPropertyTarget { id: NodeId, target: Option<NodeId> },
+    SetProp { id: NodeId, prop: Prop },
     /// Switch which frame of a Case/Event structure is displayed (not undoable).
     SetFrameView { id: NodeId, frame: usize },
     /// Insert a frame after `after` in a Case or Flat Sequence structure.
@@ -905,10 +1008,12 @@ impl Editor {
             Command::MoveNode { id, .. } => Some((0, *id)),
             Command::MovePanelItem { id, .. } => Some((1, *id)),
             Command::SetType { id, .. } => Some((3, *id)),
+            Command::ResizePanelItem { id, .. } => Some((4, *id)),
+            Command::MovePanelItems { moves } => moves.first().map(|m| (5, m.0)),
             Command::Resize { id, .. } => Some((2, *id)),
             _ => None,
         };
-        let record = !matches!(cmd, Command::SetValue { .. } | Command::SetFrameView { .. }) && !(key.is_some() && key == self.last_key);
+        let record = !matches!(cmd, Command::SetValue { .. } | Command::SetFrameView { .. } | Command::SetGraphConfig { .. }) && !(key.is_some() && key == self.last_key);
         let mut next = self.vi.clone();
         let created = Self::exec(&mut next, cmd)?;
         if record {
@@ -945,17 +1050,21 @@ impl Editor {
                 let widget = widget.unwrap_or_else(|| Widget::default_for(&kind));
                 let value = match &kind {
                     NodeKind::Control { ty, .. } | NodeKind::Indicator { ty, .. } => {
-                        if widget == Widget::Chart { Some(Value::default_for(&DataType::arr_dbl())) } else { Some(Value::default_for(ty)) }
+                        if widget == Widget::Chart { Some(chart_default(ty)) } else { Some(Value::default_for(ty)) }
                     }
                     NodeKind::Constant(ty) => Some(Value::default_for(ty)),
                     _ => None,
                 };
                 let size = kind.default_size();
-                let panel_pos = if kind.is_panel_item() { vi.free_panel_spot(widget.panel_size(match &kind { NodeKind::Control { ty, .. } | NodeKind::Indicator { ty, .. } => ty, _ => &DataType::DBL })) } else { [0.0, 0.0] };
+                let panel_pos = match &kind {
+                    NodeKind::Control { ty, .. } | NodeKind::Indicator { ty, .. } => vi.free_panel_spot(widget.panel_size(ty)),
+                    NodeKind::Decoration { deco, .. } => vi.free_panel_spot(deco.default_size()),
+                    _ => [0.0, 0.0],
+                };
                 let center = [pos[0] + size[0] / 2.0, pos[1] + size[1] / 2.0];
                 let parent = if kind.is_structure() { None } else { vi.container_at(center, None) };
                 let frame = parent.map(|p| vi.frame_at(p, center)).unwrap_or(0);
-                vi.nodes.push(Node { id, kind, pos, size, panel_pos, widget, range: [0.0, 10.0], parent, frame, frame_view: 0, value });
+                vi.nodes.push(Node { id, kind, pos, size, panel_pos, widget, range: [0.0, 10.0], parent, frame, frame_view: 0, value, panel_size_override: None, graph: GraphConfig::default(), visible: true, disabled: false, caption: None });
                 Ok(Some(id))
             }
             Command::RemoveNode(id) => {
@@ -967,6 +1076,7 @@ impl Editor {
                 }
                 vi.nodes.retain(|n| n.id != id);
                 vi.wires.retain(|w| w.from.0 != id && w.to.0 != id);
+                clear_dangling_targets(vi);
                 Ok(None)
             }
             Command::MoveNode { id, pos } => {
@@ -1199,6 +1309,110 @@ impl Editor {
                 vi.wires.retain(|w| !(w.to.0 == id && w.to.1 >= min_in) && !(w.from.0 == id && w.from.1 >= min_out));
                 Ok(None)
             }
+            Command::MovePanelItems { moves } => {
+                for (id, pos) in moves {
+                    vi.node_mut(id).ok_or(EditError::NoNode(id))?.panel_pos = pos;
+                }
+                Ok(None)
+            }
+            Command::SnapPanel { ids, grid } => {
+                let g = grid.max(1.0);
+                for n in vi.nodes.iter_mut().filter(|n| ids.contains(&n.id)) {
+                    n.panel_pos = [(n.panel_pos[0] / g).round() * g, (n.panel_pos[1] / g).round() * g];
+                }
+                Ok(None)
+            }
+            Command::ResizePanelItem { id, size } => {
+                let n = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
+                if !(n.widget.resizable() || n.kind.is_decoration()) {
+                    return Err(EditError::WrongNodeKind(id));
+                }
+                n.panel_size_override = Some([size[0].max(30.0), size[1].max(8.0)]);
+                Ok(None)
+            }
+            Command::SetGraphConfig { id, cfg } => {
+                vi.node_mut(id).ok_or(EditError::NoNode(id))?.graph = cfg;
+                Ok(None)
+            }
+            Command::SetItemProps { id, visible, disabled, caption } => {
+                let n = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
+                if let Some(v) = visible {
+                    n.visible = v;
+                }
+                if let Some(d) = disabled {
+                    n.disabled = d;
+                }
+                if let Some(c) = caption {
+                    n.caption = c;
+                }
+                Ok(None)
+            }
+            Command::SetDecoration { id, text, color } => {
+                match &mut vi.node_mut(id).ok_or(EditError::NoNode(id))?.kind {
+                    NodeKind::Decoration { text: t, color: c, .. } => {
+                        if let Some(x) = text {
+                            *t = x;
+                        }
+                        if let Some(x) = color {
+                            *c = x;
+                        }
+                    }
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                Ok(None)
+            }
+            Command::ArrangePanel { ids, op } => {
+                let on_panel = |n: &Node| n.kind.is_panel_item() || n.kind.is_decoration();
+                let picked: Vec<usize> = (0..vi.nodes.len()).filter(|i| ids.contains(&vi.nodes[*i].id) && on_panel(&vi.nodes[*i])).collect();
+                match op {
+                    Arrange::BringToFront | Arrange::SendToBack => {
+                        let mut moved = vec![];
+                        for i in picked.iter().rev() {
+                            moved.push(vi.nodes.remove(*i));
+                        }
+                        moved.reverse();
+                        if op == Arrange::BringToFront {
+                            vi.nodes.extend(moved);
+                        } else {
+                            moved.append(&mut vi.nodes);
+                            vi.nodes = moved;
+                        }
+                    }
+                    _ => {
+                        let rects: Vec<_> = picked.iter().map(|i| (vi.nodes[*i].panel_pos, vi.nodes[*i].panel_size())).collect();
+                        let out = arrange_rects(&rects, op);
+                        for (i, (pos, size)) in picked.iter().zip(out) {
+                            let n = &mut vi.nodes[*i];
+                            n.panel_pos = pos;
+                            if matches!(op, Arrange::SameWidth | Arrange::SameHeight) && (n.widget.resizable() || n.kind.is_decoration()) {
+                                n.panel_size_override = Some(size);
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Command::SetPropertyTarget { id, target } => {
+                if let Some(t) = target {
+                    let ok = vi.node(t).ok_or(EditError::NoNode(t))?;
+                    if !(ok.kind.is_panel_item() || ok.kind.is_decoration()) {
+                        return Err(EditError::WrongNodeKind(t));
+                    }
+                }
+                match &mut vi.node_mut(id).ok_or(EditError::NoNode(id))?.kind {
+                    NodeKind::Property { target: t, .. } => *t = target,
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                Ok(None)
+            }
+            Command::SetProp { id, prop: p } => {
+                match &mut vi.node_mut(id).ok_or(EditError::NoNode(id))?.kind {
+                    NodeKind::Property { prop, .. } => *prop = p,
+                    _ => return Err(EditError::WrongNodeKind(id)),
+                }
+                prune_invalid_wires(vi);
+                Ok(None)
+            }
             Command::SetFrameView { id, frame } => {
                 let n = vi.node_mut(id).ok_or(EditError::NoNode(id))?;
                 n.frame_view = frame.min(n.kind.frame_count().max(1) - 1);
@@ -1374,7 +1588,7 @@ impl Editor {
             }
             Command::SetWrite { id, write: w } => {
                 match &mut vi.node_mut(id).ok_or(EditError::NoNode(id))?.kind {
-                    NodeKind::Local { write, .. } | NodeKind::Global { write, .. } => *write = w,
+                    NodeKind::Local { write, .. } | NodeKind::Global { write, .. } | NodeKind::Property { write, .. } => *write = w,
                     _ => return Err(EditError::WrongNodeKind(id)),
                 }
                 vi.wires.retain(|x| x.from.0 != id && x.to.0 != id);
@@ -1469,11 +1683,20 @@ fn remove_subtree(vi: &mut Vi, id: NodeId) {
     doomed.push(id);
     vi.nodes.retain(|n| !doomed.contains(&n.id));
     vi.wires.retain(|w| !doomed.contains(&w.from.0) && !doomed.contains(&w.to.0));
+    clear_dangling_targets(vi);
+}
+
+/// Local Variables and Property Nodes forget a target that no longer exists.
+fn clear_dangling_targets(vi: &mut Vi) {
+    let alive: Vec<NodeId> = vi.nodes.iter().map(|n| n.id).collect();
     for n in vi.nodes.iter_mut() {
-        if let NodeKind::Local { target: Some(t), .. } = &mut n.kind {
-            if doomed.contains(t) {
-                n.kind = NodeKind::Local { target: None, ty: DataType::DBL, write: matches!(n.kind, NodeKind::Local { write: true, .. }) };
+        match &mut n.kind {
+            NodeKind::Local { target, .. } | NodeKind::Property { target, .. } => {
+                if target.is_some_and(|t| !alive.contains(&t)) {
+                    *target = None;
+                }
             }
+            _ => {}
         }
     }
 }

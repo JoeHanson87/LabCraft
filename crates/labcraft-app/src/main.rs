@@ -1,5 +1,6 @@
 mod app;
 mod diagram;
+mod graph;
 mod panel;
 mod theme;
 mod valedit;

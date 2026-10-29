@@ -149,6 +149,21 @@ impl DataType {
             Self::field("source", DataType::Str),
         ])
     }
+    /// LabVIEW's waveform: initial time, sample interval, and samples.
+    pub fn waveform() -> DataType {
+        DataType::Cluster(vec![Self::field("t0", DataType::DBL), Self::field("dt", DataType::DBL), Self::field("Y", DataType::arr_dbl())])
+    }
+    pub fn is_waveform(&self) -> bool {
+        matches!(self, DataType::Cluster(f) if f.len() == 3 && f[0].ty.is_numeric_scalar() && f[1].ty.is_numeric_scalar() && matches!(&f[2].ty, DataType::Array(e, 1) if e.is_numeric_scalar()))
+    }
+    /// A cluster of an X array and a Y array (an XY graph's data).
+    pub fn is_xy(&self) -> bool {
+        matches!(self, DataType::Cluster(f) if f.len() == 2 && f.iter().all(|x| matches!(&x.ty, DataType::Array(e, 1) if e.is_numeric_scalar())))
+    }
+    /// A cluster of two or more numeric scalars (a multi-plot chart's sample).
+    pub fn is_multi_chart(&self) -> bool {
+        matches!(self, DataType::Cluster(f) if f.len() >= 2 && f.iter().all(|x| x.ty.is_numeric_scalar()))
+    }
     pub fn is_error_cluster(&self) -> bool {
         self.fieldwise_same(&Self::error_cluster())
     }

@@ -1,13 +1,15 @@
 use crate::app::LabCraft;
+use crate::graph;
 use crate::theme;
 use crate::valedit;
 use eframe::egui::{self, epaint::Shape, Align2, Color32, FontId, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2};
-use labcraft_core::{Command, DataType, Node, NodeKind, Value, Widget};
+use labcraft_core::{Command, DataType, Node, NodeId, NodeKind, Value, Widget};
 
-const SWAPPABLE: [Widget; 18] = [
+const SWAPPABLE: [Widget; 23] = [
     Widget::NumCtl, Widget::Knob, Widget::Slide, Widget::NumInd, Widget::Gauge, Widget::Thermometer, Widget::Tank,
     Widget::Toggle, Widget::PushButton, Widget::Led, Widget::StrCtl, Widget::StrInd, Widget::EnumCtl, Widget::EnumInd,
-    Widget::Graph, Widget::ArrayInd, Widget::ArrayCtl, Widget::ClusterCtl,
+    Widget::Graph, Widget::XyGraph, Widget::IntensityGraph, Widget::Table, Widget::ListBox,
+    Widget::ArrayInd, Widget::ArrayCtl, Widget::ClusterCtl, Widget::ClusterInd,
 ];
 
 fn v2(p: [f32; 2]) -> Vec2 {
@@ -50,142 +52,390 @@ fn tick_labels(p: &Painter, pos: Pos2, align: Align2, text: String) {
     p.text(pos, align, text, FontId::proportional(9.5), theme::TEXT_DIM);
 }
 
+/// Plain click selects one item; Shift/Cmd-click adds or removes it from the selection.
+fn select_click(app: &mut LabCraft, ui: &Ui, id: NodeId) {
+    let additive = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+    if additive {
+        if !app.panel_sel.remove(&id) {
+            app.panel_sel.insert(id);
+        }
+    } else if !app.panel_sel.contains(&id) {
+        app.panel_sel.clear();
+        app.panel_sel.insert(id);
+    }
+    app.selected = Some(id);
+}
+
+/// Shared drag handling for panel items and decorations: moves the whole selection together.
+fn item_drag(app: &mut LabCraft, ui: &Ui, n: &Node, g: &egui::Response) {
+    if g.clicked() || g.drag_started() {
+        select_click(app, ui, n.id);
+    }
+    if g.dragged() {
+        let d = g.drag_delta();
+        let ids: Vec<NodeId> = if app.panel_sel.contains(&n.id) { app.panel_sel.iter().copied().collect() } else { vec![n.id] };
+        let moves: Vec<(NodeId, [f32; 2])> = ids
+            .iter()
+            .filter_map(|id| app.ed.vi.node(*id))
+            .map(|m| (m.id, [m.panel_pos[0] + d.x, m.panel_pos[1] + d.y]))
+            .collect();
+        app.pending.push(Command::MovePanelItems { moves });
+    }
+    if g.drag_stopped() {
+        app.pending.push(Command::EndGesture);
+        if app.snap_grid {
+            let ids: Vec<NodeId> = if app.panel_sel.contains(&n.id) { app.panel_sel.iter().copied().collect() } else { vec![n.id] };
+            app.pending.push(Command::SnapPanel { ids, grid: 10.0 });
+        }
+    }
+}
+
+fn resize_handle(app: &mut LabCraft, ui: &mut Ui, painter: &Painter, n: &Node, r: Rect) {
+    let handle = Rect::from_min_size(r.max - Vec2::splat(14.0), Vec2::splat(14.0));
+    painter.text(handle.center(), Align2::CENTER_CENTER, "◢", FontId::proportional(12.0), theme::ACCENT);
+    let rz = ui.interact(handle, ui.scope_id().with(("presize", n.id)), Sense::drag());
+    if rz.hovered() || rz.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+    }
+    if rz.dragged() {
+        let d = rz.drag_delta();
+        let s = n.panel_size();
+        app.pending.push(Command::ResizePanelItem { id: n.id, size: [s[0] + d.x, s[1] + d.y] });
+    }
+    if rz.drag_stopped() {
+        app.pending.push(Command::EndGesture);
+    }
+}
+
+fn draw_decoration(app: &mut LabCraft, ui: &mut Ui, painter: &Painter, origin: Pos2, n: &Node) {
+    let NodeKind::Decoration { deco, text, color } = &n.kind else { return };
+    let col = Color32::from_rgb(color[0], color[1], color[2]);
+    let r = Rect::from_min_size(origin + v2(n.panel_pos), v2(n.panel_size()));
+    let selected = app.panel_sel.contains(&n.id);
+    match deco {
+        labcraft_core::DecoKind::Box => {
+            painter.rect_filled(r, 6.0, col.linear_multiply(0.12));
+            painter.rect_stroke(r, 6.0, Stroke::new(1.5, col.linear_multiply(0.8)), StrokeKind::Inside);
+            if !text.is_empty() {
+                painter.text(r.left_top() + Vec2::new(12.0, 8.0), Align2::LEFT_TOP, text, FontId::proportional(12.0), col);
+            }
+        }
+        labcraft_core::DecoKind::Line => {
+            let (a, b) = if r.width() >= r.height() { (r.left_center(), r.right_center()) } else { (r.center_top(), r.center_bottom()) };
+            painter.line_segment([a, b], Stroke::new(2.5, col));
+        }
+        labcraft_core::DecoKind::Label => {
+            painter.text(r.left_center() + Vec2::new(2.0, 0.0), Align2::LEFT_CENTER, if text.is_empty() { "Label" } else { text }, FontId::proportional(15.0), col);
+        }
+    }
+    if selected {
+        painter.rect_stroke(r.expand(3.0), 3.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Outside);
+    }
+    let g = ui.interact(r, ui.scope_id().with(("deco", n.id)), Sense::click_and_drag());
+    item_drag(app, ui, n, &g);
+    g.context_menu(|ui| {
+        let mut t = text.clone();
+        ui.horizontal(|ui| {
+            ui.label("Text");
+            if ui.add(egui::TextEdit::singleline(&mut t).desired_width(120.0)).changed() {
+                app.pending.push(Command::SetDecoration { id: n.id, text: Some(t.clone()), color: None });
+            }
+        });
+        let mut c = *color;
+        if ui.color_edit_button_srgb(&mut c).changed() {
+            app.pending.push(Command::SetDecoration { id: n.id, text: None, color: Some(c) });
+        }
+        if ui.button("Send to Back").clicked() {
+            app.pending.push(Command::ArrangePanel { ids: vec![n.id], op: labcraft_core::Arrange::SendToBack });
+            ui.close();
+        }
+        if ui.button("Delete").clicked() {
+            app.pending.push(Command::RemoveNode(n.id));
+            ui.close();
+        }
+    });
+    if app.selected == Some(n.id) && !matches!(deco, labcraft_core::DecoKind::Label) {
+        resize_handle(app, ui, painter, n, r);
+    }
+}
+
 pub fn show(app: &mut LabCraft, ui: &mut Ui) {
-    let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click());
+    let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
     let origin = resp.rect.min;
     painter.rect_filled(resp.rect, 0.0, theme::BG_PANEL);
+    let step = if app.snap_grid { 10.0 } else { 40.0 };
+    let alpha = if app.snap_grid { 6 } else { 4 };
     let mut gx = resp.rect.left();
     while gx < resp.rect.right() {
-        painter.line_segment([Pos2::new(gx, resp.rect.top()), Pos2::new(gx, resp.rect.bottom())], Stroke::new(1.0, Color32::from_white_alpha(4)));
-        gx += 40.0;
+        painter.line_segment([Pos2::new(gx, resp.rect.top()), Pos2::new(gx, resp.rect.bottom())], Stroke::new(1.0, Color32::from_white_alpha(alpha)));
+        gx += step;
     }
     let mut gy = resp.rect.top();
     while gy < resp.rect.bottom() {
-        painter.line_segment([Pos2::new(resp.rect.left(), gy), Pos2::new(resp.rect.right(), gy)], Stroke::new(1.0, Color32::from_white_alpha(4)));
-        gy += 40.0;
+        painter.line_segment([Pos2::new(resp.rect.left(), gy), Pos2::new(resp.rect.right(), gy)], Stroke::new(1.0, Color32::from_white_alpha(alpha)));
+        gy += step;
+    }
+
+    let running = app.is_running();
+    let nodes = app.ed.vi.nodes.clone();
+    let pointer = ui.input(|i| i.pointer.interact_pos());
+
+    // Rubber-band selection on empty canvas.
+    if resp.drag_started() {
+        app.panel_band = pointer;
+    }
+    if let (Some(a), Some(b)) = (app.panel_band, pointer) {
+        let band = Rect::from_two_pos(a, b);
+        painter.rect_filled(band, 0.0, theme::ACCENT.linear_multiply(0.12));
+        painter.rect_stroke(band, 0.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside);
+    }
+    if resp.drag_stopped() {
+        if let (Some(a), Some(b)) = (app.panel_band.take(), pointer) {
+            let band = Rect::from_two_pos(a, b);
+            if !ui.input(|i| i.modifiers.shift || i.modifiers.command) {
+                app.panel_sel.clear();
+            }
+            for n in nodes.iter().filter(|n| n.kind.is_panel_item() || n.kind.is_decoration()) {
+                if band.intersects(Rect::from_min_size(origin + v2(n.panel_pos), v2(n.panel_size()))) {
+                    app.panel_sel.insert(n.id);
+                }
+            }
+            app.selected = app.panel_sel.iter().next().copied();
+        }
     }
     if resp.clicked() {
         app.selected = None;
+        app.panel_sel.clear();
     }
 
-    let nodes = app.ed.vi.nodes.clone();
-    let items: Vec<&Node> = nodes.iter().filter(|n| n.kind.is_panel_item()).collect();
-    for n in &items {
+    // Decorations sit behind controls.
+    let ordered: Vec<&Node> = nodes.iter().filter(|n| n.kind.is_decoration()).chain(nodes.iter().filter(|n| n.kind.is_panel_item())).collect();
+    let mut any = false;
+    for n in ordered {
+        any = true;
+        if running && !n.visible {
+            continue;
+        }
+        if n.kind.is_decoration() {
+            draw_decoration(app, ui, &painter, origin, n);
+            continue;
+        }
         let (name, ty, is_ctl) = match &n.kind {
             NodeKind::Control { name, ty } => (name, ty.clone(), true),
             NodeKind::Indicator { name, ty } => (name, ty.clone(), false),
             _ => continue,
         };
+        // Items hidden by a property show dimmed while editing.
+        let mut painter = painter.clone();
+        if !n.visible {
+            painter.set_opacity(0.3);
+        }
         let col = theme::type_color(&ty);
         let size = v2(n.panel_size());
         let r = Rect::from_min_size(origin + v2(n.panel_pos), size);
-        if app.selected == Some(n.id) {
+        if app.panel_sel.contains(&n.id) {
             painter.rect_stroke(r.expand(4.0), 3.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Outside);
         }
 
         let label_r = Rect::from_min_size(r.min, Vec2::new(size.x, 16.0));
         let g = ui.interact(label_r, ui.scope_id().with(("grab", n.id)), Sense::click_and_drag());
-        if g.clicked() || g.drag_started() {
-            app.selected = Some(n.id);
-        }
-        if g.dragged() {
-            let d = g.drag_delta();
-            app.pending.push(Command::MovePanelItem { id: n.id, pos: [n.panel_pos[0] + d.x, n.panel_pos[1] + d.y] });
-        }
-        if g.drag_stopped() {
-            app.pending.push(Command::EndGesture);
-        }
+        item_drag(app, ui, n, &g);
         g.context_menu(|ui| item_menu(app, ui, n, &ty, is_ctl));
-        painter.text(r.min + Vec2::new(2.0, 8.0), Align2::LEFT_CENTER, name, FontId::proportional(11.5), Color32::from_gray(190));
+        let shown = n.caption.clone().unwrap_or_else(|| name.clone());
+        painter.text(r.min + Vec2::new(2.0, 8.0), Align2::LEFT_CENTER, &shown, FontId::proportional(11.5), Color32::from_gray(190));
 
         let body = Rect::from_min_max(r.min + Vec2::new(0.0, 18.0), r.max);
         let id = ui.scope_id().with(("w", n.id));
         let value = n.value.clone().unwrap_or(Value::default_for(&ty));
         let range = n.range;
-        let new = match n.widget {
-            Widget::NumCtl => num_ctl(ui, &painter, id, body, &value, col),
-            Widget::NumInd => {
-                let r = Rect::from_min_size(body.min, Vec2::new(body.width(), 26.0));
-                sunken(&painter, r);
-                painter.text(r.right_center() - Vec2::new(6.0, 0.0), Align2::RIGHT_CENTER, fmt(value.as_f64().unwrap_or(0.0)), FontId::monospace(14.0), col);
-                None
-            }
-            Widget::Knob => knob(ui, &painter, id, body, &value, range, col, is_ctl),
-            Widget::Slide => slide(ui, &painter, id, body, &value, range, col, is_ctl),
-            Widget::Gauge => {
-                gauge(&painter, body, value.as_f64().unwrap_or(0.0), range, col);
-                None
-            }
-            Widget::Thermometer => {
-                thermometer(&painter, body, value.as_f64().unwrap_or(0.0), range);
-                None
-            }
-            Widget::Tank => {
-                tank(&painter, body, value.as_f64().unwrap_or(0.0), range);
-                None
-            }
-            Widget::Toggle => toggle(ui, &painter, id, body, matches!(value, Value::Bool(true))),
-            Widget::PushButton => push_button(ui, &painter, id, body, matches!(value, Value::Bool(true)), name),
-            Widget::Led => {
-                led(&painter, body, matches!(value, Value::Bool(true)));
-                None
-            }
-            Widget::StrCtl => str_ctl(ui, &painter, body, &value),
-            Widget::StrInd => {
-                let r = Rect::from_min_size(body.min, Vec2::new(body.width(), 26.0));
-                sunken(&painter, r);
-                painter.with_clip_rect(r).text(r.left_center() + Vec2::new(6.0, 0.0), Align2::LEFT_CENTER, value.to_string(), FontId::monospace(13.0), col);
-                None
-            }
-            Widget::Chart | Widget::Graph => {
-                plot(&painter, body, &value.to_f64_vec(), n.widget == Widget::Chart);
-                None
-            }
-            Widget::EnumCtl | Widget::EnumInd => {
-                let r = Rect::from_min_size(body.min, Vec2::new(body.width(), 26.0));
-                let (DataType::Enum(items), Value::Int(i)) = (&ty, &value) else { continue };
-                if is_ctl {
-                    sunken(&painter, r);
-                    let mut idx = *i;
-                    ui.scope_builder(UiBuilder::new().max_rect(r.shrink(1.0)).id_salt(("enum", n.id)), |ui| {
-                        egui::ComboBox::from_id_salt(("enumcb", n.id)).width(r.width() - 10.0).selected_text(items.get(idx as usize).cloned().unwrap_or_default()).show_ui(ui, |ui| {
-                            for (k, it) in items.iter().enumerate() {
-                                ui.selectable_value(&mut idx, k as i64, it);
-                            }
-                        });
-                    });
-                    (idx != *i).then(|| Value::Int(idx))
-                } else {
-                    sunken(&painter, r);
-                    painter.text(r.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, items.get(*i as usize).cloned().unwrap_or_default(), FontId::proportional(13.0), col);
-                    None
+        let new = ui
+            .scope(|ui| {
+                if n.disabled {
+                    ui.disable();
                 }
-            }
-            Widget::ArrayCtl | Widget::ArrayInd | Widget::ClusterCtl | Widget::ClusterInd => {
-                let frame = body.shrink2(Vec2::new(0.0, 0.0));
-                painter.rect_filled(frame, 3.0, Color32::from_rgb(26, 28, 34));
-                painter.rect_stroke(frame, 3.0, Stroke::new(1.5, col.linear_multiply(0.7)), StrokeKind::Inside);
-                let mut v = value.clone();
-                let changed = ui
-                    .scope_builder(UiBuilder::new().max_rect(frame.shrink(6.0)).id_salt(("val", n.id)), |ui| {
-                        ui.set_clip_rect(frame.shrink(1.0));
-                        valedit::edit_value(ui, &ty, &mut v, is_ctl)
-                    })
-                    .inner;
-                changed.then_some(v)
-            }
-        };
+                match n.widget {
+                    Widget::NumCtl => num_ctl(ui, &painter, id, body, &value, col),
+                    Widget::NumInd => {
+                        let r = Rect::from_min_size(body.min, Vec2::new(body.width(), 26.0));
+                        sunken(&painter, r);
+                        painter.text(r.right_center() - Vec2::new(6.0, 0.0), Align2::RIGHT_CENTER, fmt(value.as_f64().unwrap_or(0.0)), FontId::monospace(14.0), col);
+                        None
+                    }
+                    Widget::Knob => knob(ui, &painter, id, body, &value, range, col, is_ctl),
+                    Widget::Slide => slide(ui, &painter, id, body, &value, range, col, is_ctl),
+                    Widget::Gauge => {
+                        gauge(&painter, body, value.as_f64().unwrap_or(0.0), range, col);
+                        None
+                    }
+                    Widget::Thermometer => {
+                        thermometer(&painter, body, value.as_f64().unwrap_or(0.0), range);
+                        None
+                    }
+                    Widget::Tank => {
+                        tank(&painter, body, value.as_f64().unwrap_or(0.0), range);
+                        None
+                    }
+                    Widget::Toggle => toggle(ui, &painter, id, body, matches!(value, Value::Bool(true))),
+                    Widget::PushButton => push_button(ui, &painter, id, body, matches!(value, Value::Bool(true)), &shown),
+                    Widget::Led => {
+                        led(&painter, body, matches!(value, Value::Bool(true)));
+                        None
+                    }
+                    Widget::StrCtl => str_ctl(ui, &painter, body, &value),
+                    Widget::StrInd => {
+                        let r = Rect::from_min_size(body.min, Vec2::new(body.width(), 26.0));
+                        sunken(&painter, r);
+                        painter.with_clip_rect(r).text(r.left_center() + Vec2::new(6.0, 0.0), Align2::LEFT_CENTER, value.to_string(), FontId::monospace(13.0), col);
+                        None
+                    }
+                    Widget::Chart | Widget::Graph | Widget::XyGraph => {
+                        let series = graph::series_for(n.widget, &ty, &value);
+                        if let Some(cfg) = graph::draw_lines(ui, &painter, body, n, &series, n.widget == Widget::Chart) {
+                            app.pending.push(Command::SetGraphConfig { id: n.id, cfg });
+                        }
+                        None
+                    }
+                    Widget::IntensityGraph => {
+                        graph::draw_intensity(&painter, body, n, &value);
+                        None
+                    }
+                    Widget::Table => table_widget(ui, body, &ty, &value, is_ctl, n.id),
+                    Widget::ListBox => listbox_widget(ui, body, &value, is_ctl, n.id),
+                    Widget::EnumCtl | Widget::EnumInd => {
+                        let r = Rect::from_min_size(body.min, Vec2::new(body.width(), 26.0));
+                        let (DataType::Enum(items), Value::Int(i)) = (&ty, &value) else { return None };
+                        sunken(&painter, r);
+                        if is_ctl {
+                            let mut idx = *i;
+                            ui.scope_builder(UiBuilder::new().max_rect(r.shrink(1.0)).id_salt(("enum", n.id)), |ui| {
+                                egui::ComboBox::from_id_salt(("enumcb", n.id)).width(r.width() - 10.0).selected_text(items.get(idx as usize).cloned().unwrap_or_default()).show_ui(ui, |ui| {
+                                    for (k, it) in items.iter().enumerate() {
+                                        ui.selectable_value(&mut idx, k as i64, it);
+                                    }
+                                });
+                            });
+                            (idx != *i).then(|| Value::Int(idx))
+                        } else {
+                            painter.text(r.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, items.get(*i as usize).cloned().unwrap_or_default(), FontId::proportional(13.0), col);
+                            None
+                        }
+                    }
+                    Widget::ArrayCtl | Widget::ArrayInd | Widget::ClusterCtl | Widget::ClusterInd => {
+                        let frame = body;
+                        painter.rect_filled(frame, 3.0, Color32::from_rgb(26, 28, 34));
+                        painter.rect_stroke(frame, 3.0, Stroke::new(1.5, col.linear_multiply(0.7)), StrokeKind::Inside);
+                        let mut v = value.clone();
+                        let changed = ui
+                            .scope_builder(UiBuilder::new().max_rect(frame.shrink(6.0)).id_salt(("val", n.id)), |ui| {
+                                ui.set_clip_rect(frame.shrink(1.0));
+                                valedit::edit_value(ui, &ty, &mut v, is_ctl)
+                            })
+                            .inner;
+                        changed.then_some(v)
+                    }
+                    Widget::Decoration => None,
+                }
+            })
+            .inner;
+        if n.disabled {
+            painter.rect_filled(r, 3.0, Color32::from_black_alpha(90));
+        }
         if let Some(v) = new {
             app.pending.push(Command::SetValue { id: n.id, value: v });
         }
+        if app.selected == Some(n.id) && n.widget.resizable() {
+            resize_handle(app, ui, &painter, n, r);
+        }
     }
-    if items.is_empty() {
+    if !any {
         painter.text(resp.rect.center(), Align2::CENTER_CENTER, "Add controls and indicators from the palette", FontId::proportional(14.0), theme::TEXT_DIM);
     }
 }
 
+fn table_widget(ui: &mut Ui, body: Rect, ty: &DataType, value: &Value, editable: bool, id: NodeId) -> Option<Value> {
+    let (DataType::Array(elem, 2), Value::Array(a)) = (ty, value) else { return None };
+    ui.painter().rect_filled(body, 3.0, Color32::from_rgb(20, 22, 27));
+    ui.painter().rect_stroke(body, 3.0, Stroke::new(1.0, Color32::from_gray(80)), StrokeKind::Inside);
+    let mut arr = a.clone();
+    let mut changed = false;
+    ui.scope_builder(UiBuilder::new().max_rect(body.shrink(4.0)).id_salt(("table", id)), |ui| {
+        ui.set_clip_rect(body.shrink(1.0));
+        if editable {
+            ui.horizontal(|ui| {
+                for (d, name) in ["rows", "cols"].into_iter().enumerate() {
+                    let mut n = arr.dims[d];
+                    if ui.add(egui::DragValue::new(&mut n).range(0..=500).prefix(format!("{name} "))).changed() {
+                        valedit::resize_array(&mut arr, elem, d, n);
+                        changed = true;
+                    }
+                }
+            });
+        }
+        let (rows, cols) = (arr.dims[0], arr.dims[1].max(1));
+        egui::ScrollArea::both().id_salt(("tscroll", id)).auto_shrink([false, false]).show(ui, |ui| {
+            egui::Grid::new(("tgrid", id)).striped(true).spacing([6.0, 3.0]).show(ui, |ui| {
+                ui.label("");
+                for c in 0..cols {
+                    ui.label(egui::RichText::new(format!("{c}")).size(10.0).color(theme::TEXT_DIM));
+                }
+                ui.end_row();
+                for r in 0..rows {
+                    ui.label(egui::RichText::new(format!("{r}")).size(10.0).color(theme::TEXT_DIM));
+                    for c in 0..cols {
+                        if let Some(cell) = arr.data.get_mut(r * cols + c) {
+                            changed |= valedit::edit_value(ui, elem, cell, editable);
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+    });
+    changed.then(|| Value::Array(arr))
+}
+
+fn listbox_widget(ui: &mut Ui, body: Rect, value: &Value, editable: bool, id: NodeId) -> Option<Value> {
+    let Value::Array(a) = value else { return None };
+    ui.painter().rect_filled(body, 3.0, theme::SUNKEN);
+    ui.painter().rect_stroke(body, 3.0, Stroke::new(1.0, Color32::from_gray(80)), StrokeKind::Inside);
+    let mut arr = a.clone();
+    let mut changed = false;
+    ui.scope_builder(UiBuilder::new().max_rect(body.shrink(4.0)).id_salt(("list", id)), |ui| {
+        ui.set_clip_rect(body.shrink(1.0));
+        egui::ScrollArea::vertical().id_salt(("lscroll", id)).auto_shrink([false, false]).show(ui, |ui| {
+            for (i, cell) in arr.data.iter_mut().enumerate() {
+                let Value::Str(s) = cell else { continue };
+                if editable {
+                    changed |= ui.add(egui::TextEdit::singleline(s).desired_width(body.width() - 20.0)).changed();
+                } else {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(body.width() - 14.0, 18.0), Sense::hover());
+                    if i % 2 == 1 {
+                        ui.painter().rect_filled(rect, 0.0, Color32::from_white_alpha(8));
+                    }
+                    ui.painter().text(rect.left_center() + Vec2::new(4.0, 0.0), Align2::LEFT_CENTER, s.as_str(), FontId::proportional(12.5), theme::type_color(&DataType::Str));
+                }
+            }
+            if editable {
+                ui.horizontal(|ui| {
+                    if ui.small_button("＋").clicked() {
+                        arr.data.push(Value::Str(String::new()));
+                        changed = true;
+                    }
+                    if ui.small_button("－").clicked() && arr.data.pop().is_some() {
+                        changed = true;
+                    }
+                });
+            }
+        });
+    });
+    if changed {
+        arr.dims = vec![arr.data.len()];
+    }
+    changed.then(|| Value::Array(arr))
+}
+
 fn item_menu(app: &mut LabCraft, ui: &mut Ui, n: &Node, ty: &DataType, is_ctl: bool) {
-    let options: Vec<Widget> = SWAPPABLE.iter().copied().filter(|w| w.fits(ty, is_ctl) && !matches!(w, Widget::Graph if n.widget == Widget::Chart)).collect();
+    let options: Vec<Widget> = SWAPPABLE.iter().copied().filter(|w| w.fits(ty, is_ctl)).collect();
     if options.len() > 1 {
         ui.menu_button("Replace with", |ui| {
             for w in &options {
@@ -204,6 +454,32 @@ fn item_menu(app: &mut LabCraft, ui: &mut Ui, n: &Node, ty: &DataType, is_ctl: b
             }
         });
     }
+    if matches!(n.widget, Widget::Chart | Widget::Graph | Widget::XyGraph | Widget::IntensityGraph) {
+        let value = n.value.clone().unwrap_or(Value::default_for(ty));
+        let plots = graph::plot_count(n.widget, ty, &value);
+        ui.menu_button("Graph properties", |ui| {
+            if let Some(cfg) = graph::config_menu(ui, n, plots) {
+                app.pending.push(Command::SetGraphConfig { id: n.id, cfg });
+            }
+        });
+    }
+    ui.menu_button("Properties", |ui| {
+        let (mut visible, mut disabled) = (n.visible, n.disabled);
+        if ui.checkbox(&mut visible, "Visible").changed() {
+            app.pending.push(Command::SetItemProps { id: n.id, visible: Some(visible), disabled: None, caption: None });
+        }
+        if ui.checkbox(&mut disabled, "Disabled").changed() {
+            app.pending.push(Command::SetItemProps { id: n.id, visible: None, disabled: Some(disabled), caption: None });
+        }
+        let mut cap = n.caption.clone().unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label("Caption");
+            if ui.add(egui::TextEdit::singleline(&mut cap).desired_width(100.0)).changed() {
+                let value = if cap.is_empty() { None } else { Some(cap.clone()) };
+                app.pending.push(Command::SetItemProps { id: n.id, visible: None, disabled: None, caption: Some(value) });
+            }
+        });
+    });
     if n.widget.is_numeric_scaled() {
         let mut range = n.range;
         ui.horizontal(|ui| {
@@ -216,6 +492,14 @@ fn item_menu(app: &mut LabCraft, ui: &mut Ui, n: &Node, ty: &DataType, is_ctl: b
             }
         });
     }
+    ui.menu_button("Arrange", |ui| {
+        for (label, op) in [("Bring to Front", labcraft_core::Arrange::BringToFront), ("Send to Back", labcraft_core::Arrange::SendToBack)] {
+            if ui.button(label).clicked() {
+                app.pending.push(Command::ArrangePanel { ids: vec![n.id], op });
+                ui.close();
+            }
+        }
+    });
     if ui.button("Delete").clicked() {
         app.pending.push(Command::RemoveNode(n.id));
         ui.close();
@@ -436,56 +720,4 @@ fn str_ctl(ui: &mut Ui, p: &Painter, body: Rect, value: &Value) -> Option<Value>
         })
         .inner;
     changed.then(|| Value::Str(s))
-}
-
-fn plot(p: &Painter, body: Rect, data: &[f64], chart: bool) {
-    let plot = Rect::from_min_max(body.min + Vec2::new(46.0, 4.0), body.max - Vec2::new(8.0, 22.0));
-    p.rect_filled(body, 3.0, Color32::from_rgb(20, 22, 27));
-    p.rect_filled(plot, 0.0, Color32::from_rgb(10, 11, 14));
-    let (mut lo, mut hi) = data.iter().fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
-    if data.is_empty() {
-        (lo, hi) = (0.0, 1.0);
-    } else if (hi - lo).abs() < 1e-9 {
-        (lo, hi) = (lo - 1.0, hi + 1.0);
-    } else {
-        let pad = (hi - lo) * 0.05;
-        (lo, hi) = (lo - pad, hi + pad);
-    }
-    let grid = Stroke::new(1.0, Color32::from_rgb(40, 44, 54));
-    for i in 0..=4 {
-        let f = i as f32 / 4.0;
-        let y = plot.bottom() - plot.height() * f;
-        let x = plot.left() + plot.width() * f;
-        p.line_segment([Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)], grid);
-        p.line_segment([Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())], grid);
-        tick_labels(p, Pos2::new(plot.left() - 4.0, y), Align2::RIGHT_CENTER, format!("{:.2}", lo + (hi - lo) * f as f64));
-        let n = data.len().max(1);
-        tick_labels(p, Pos2::new(x, plot.bottom() + 9.0), Align2::CENTER_CENTER, format!("{}", ((n - 1) as f32 * f).round() as usize));
-    }
-    p.rect_stroke(plot, 0.0, Stroke::new(1.0, Color32::from_gray(90)), StrokeKind::Inside);
-    let line_col = Color32::from_rgb(90, 240, 170);
-    if data.is_empty() {
-        p.text(plot.center(), Align2::CENTER_CENTER, if chart { "waiting for data…" } else { "no data" }, FontId::proportional(11.0), theme::TEXT_DIM);
-    } else {
-        let step = ((data.len() as f32 / plot.width().max(1.0)).ceil() as usize).max(1);
-        let n = data.len();
-        let pt = |i: usize| {
-            let x = if n == 1 { plot.left() } else { plot.left() + plot.width() * i as f32 / (n - 1) as f32 };
-            Pos2::new(x, plot.bottom() - plot.height() * ((data[i] - lo) / (hi - lo)) as f32)
-        };
-        let mut pts: Vec<Pos2> = (0..n).step_by(step).map(pt).collect();
-        if (n - 1) % step != 0 {
-            pts.push(pt(n - 1));
-        }
-        let clipped = p.with_clip_rect(plot);
-        if pts.len() == 1 {
-            clipped.circle_filled(pts[0], 2.5, line_col);
-        } else {
-            clipped.add(Shape::line(pts, Stroke::new(1.6, line_col)));
-        }
-    }
-    let lg = Rect::from_min_size(Pos2::new(plot.right() - 62.0, plot.top() + 4.0), Vec2::new(58.0, 14.0));
-    p.rect_filled(lg, 2.0, Color32::from_black_alpha(140));
-    p.line_segment([lg.left_center() + Vec2::new(4.0, 0.0), lg.left_center() + Vec2::new(16.0, 0.0)], Stroke::new(2.0, line_col));
-    p.text(lg.left_center() + Vec2::new(20.0, 0.0), Align2::LEFT_CENTER, "Plot 0", FontId::proportional(9.5), Color32::from_gray(200));
 }

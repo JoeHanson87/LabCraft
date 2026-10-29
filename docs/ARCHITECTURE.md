@@ -30,6 +30,7 @@ This is the map for anyone picking up the project. Read it once, then use the **
 | `types.rs` | `NumKind` (I8…U64, SGL, DBL), `DataType` (`Num`, `Bool`, `Str`, `Enum`, `Array(elem, dims)`, `Cluster(fields)`), `Value` (`Dbl`, `Int`, `Bool`, `Str`, `Array(ArrayVal{dims, data})`, `Cluster`), `Value::coerce`. Enum values are stored as `Value::Int` (item index). Arrays are row-major and rectangular. U64 is limited to the i64 range. |
 | `model.rs` | `Vi`, `Node`, `Wire`, `NodeKind`, `Terminal`/`Spec`, `Widget`, **`Command`**, **`Editor`** (undo/redo), structure geometry and frame logic. The biggest file; `Editor::exec` is the single place edits are applied. |
 | `typing.rs` | Type inference for polymorphic nodes: `resolve(vi) -> TypeMap` (real output type of every terminal), `result_types`, `check_connect` (wire validation), `wire_type`/`crossing_loops` (auto-indexing), `coercion_dots`. |
+| `panel.rs` | Panel-only configuration that does not affect dataflow: `GraphConfig` (axes, legend, cursors), `DecoKind`, `Prop` (Property Node properties), and `arrange_rects` (layout maths for `Command::ArrangePanel`). |
 | `ops.rs` | Value-level operations: `broadcast` (arithmetic/logic over arrays and clusters), integer wrap-around, array build/index/init/transpose, comparisons. |
 | `eval.rs` | Dataflow runtime (`run`, `run_with`, `RunControl`) and the node/structure `compute`. Tests for the language live in `mod tests` and in `structure_tests.rs`. |
 
@@ -39,7 +40,8 @@ This is the map for anyone picking up the project. Read it once, then use the **
 |---|---|
 | `app.rs` | `LabCraft` state, toolbar, **palettes** (`panel_palette`, `diagram_palette`), example VIs (`demo_*`), background run thread + message pump, tests (headless demo runs, render smoke test). |
 | `diagram.rs` | Block diagram canvas: nodes, structures (`draw_structure`), wires (`draw_wire`, tunnel markers), terminals, context menus, wire popup. |
-| `panel.rs` | Front panel canvas and all widget drawing (knob, gauge, graph, …) plus the control/indicator context menu. |
+| `panel.rs` | Front panel canvas and widget drawing (knob, gauge, table, listbox, decorations, …), selection / rubber-band / drag / resize handling, and the control/indicator context menu. |
+| `graph.rs` | Graph and chart rendering: `series_for` maps a value to plots (waveform, multi-plot rows/columns, XY), `draw_lines`, `draw_intensity`, cursors, legend, and `config_menu`. |
 | `valedit.rs` | Generic value editor (`edit_value`) and type editor (`type_menu`) shared by panel widgets, constants and menus. |
 | `theme.rs` | Dark theme, LabVIEW wire/type colours, wire widths. |
 
@@ -69,6 +71,10 @@ Structures (`Loop`, `Case`, `Sequence`, `Event`) contain nodes via `Node.parent`
 * Case/Event only run one frame, so data leaving needs an **explicit output tunnel** (`NodeKind::Case.outs`); `Vi::check_frames` rejects direct wires out (`EditError::NeedsTunnel`) and wires between frames.
 * Flat Sequence runs frames in order with a shared "done" set, so cross-frame wires (forward only) work and implicit tunnels are fine.
 
+### Front-panel items
+
+Controls, indicators and decorations (`NodeKind::Decoration`, panel-only, skipped by the diagram and the evaluator) carry extra view state on `Node`: `panel_pos`, `panel_size_override` (only honoured when `Widget::resizable()` or for decorations), `graph: GraphConfig`, `visible`, `disabled`, `caption`. `Widget::fits(ty, is_ctl)` decides which widgets can show a type and drives the "Replace with" menu — add a new widget there. A *waveform* is the cluster `{t0, dt, Y}` (`DataType::waveform()`); XY data is a cluster of two numeric arrays; a multi-plot chart takes a cluster of numerics and stores its history as an `N×plots` array (`chart_default`). Panel z-order is the order of `Vi::nodes` (decorations are always drawn first). Property Nodes write through `RunControl::on_property` and the GUI applies the result on its thread, the same pattern as indicator updates.
+
 ### Type inference
 
 Polymorphic nodes have no fixed output type. `typing::resolve` walks the wires and applies `result_types` per node kind, memoised with cycle protection (shift registers/tunnels/feedback carry declared types). Connecting a wire runs `check_connect`; after type-changing commands `prune_invalid_wires` drops wires that no longer type-check. Untouched shift registers, tunnels and Feedback Nodes adopt the type of the first wire connected.
@@ -95,6 +101,9 @@ Polymorphic nodes have no fixed output type. `typing::resolve` walks the wires a
 1. Add a `Widget` variant; update `Widget::fits`, `panel_size`, `label` (`model.rs`).
 2. Add the drawing/interaction arm in `panel.rs::show` (and `SWAPPABLE` so it appears in "Replace with").
 3. Add a palette entry in `panel_palette()` in `app.rs`.
+
+### Add a graph or panel widget variant
+Follow *Add a front-panel widget*; for graphs add the data-to-plots mapping to `graph::series_for` and a drawing function in `graph.rs`, wire it into the `match n.widget` in `panel.rs::show`, and extend `GraphConfig` (core `panel.rs`) + `graph::config_menu` for any new setting. View-only settings should use `Command::SetGraphConfig` (not undoable).
 
 ### Add a structure
 Use Case/Event as the template: new `NodeKind` variant (+ `is_structure`, `frame_count`, terminal layout in `terminal_pos`/`terminal_visible`), commands for its frames/tunnels, an arm in `eval.rs::fire`, and drawing + menu in `diagram.rs` (`draw_structure`, `structure_menu`). Decide whether it is frame-gated (`is_frame_gated`) — that controls the output-tunnel requirement.

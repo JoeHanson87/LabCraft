@@ -91,7 +91,7 @@ pub fn show(app: &mut LabCraft, ui: &mut egui::Ui) {
         }
     }
 
-    for n in nodes.iter().filter(|n| !n.kind.is_structure() && visible.contains(&n.id)) {
+    for n in nodes.iter().filter(|n| !n.kind.is_structure() && !n.kind.is_decoration() && visible.contains(&n.id)) {
         let r = Rect::from_min_size(origin + v2(n.pos), v2(n.size));
         let sel = app.selected == Some(n.id);
         let body = ui.interact(r, ui.scope_id().with(("node", n.id)), Sense::click_and_drag());
@@ -263,6 +263,33 @@ fn node_menu(app: &mut LabCraft, ui: &mut egui::Ui, n: &Node, tm: &TypeMap) {
                 ui.close();
             }
         }
+        NodeKind::Property { target, prop, write } => {
+            let tname = target.and_then(|t| app.ed.vi.node(t)).map(|t| t.kind.title()).unwrap_or_else(|| "(choose)".into());
+            ui.menu_button(format!("Item: {tname}"), |ui| {
+                let items: Vec<(NodeId, String)> = app.ed.vi.nodes.iter().filter(|x| x.kind.is_panel_item() || x.kind.is_decoration()).map(|x| (x.id, x.kind.title())).collect();
+                if items.is_empty() {
+                    ui.label("Add a panel item first");
+                }
+                for (id, name) in items {
+                    if ui.selectable_label(*target == Some(id), name).clicked() {
+                        app.pending.push(Command::SetPropertyTarget { id: n.id, target: Some(id) });
+                        ui.close();
+                    }
+                }
+            });
+            ui.menu_button(format!("Property: {}", prop.label()), |ui| {
+                for p in labcraft_core::Prop::ALL {
+                    if ui.selectable_label(*prop == p, p.label()).clicked() {
+                        app.pending.push(Command::SetProp { id: n.id, prop: p });
+                        ui.close();
+                    }
+                }
+            });
+            if ui.button(if *write { "Change to Read" } else { "Change to Write" }).clicked() {
+                app.pending.push(Command::SetWrite { id: n.id, write: !*write });
+                ui.close();
+            }
+        }
         NodeKind::Feedback { ty } => {
             let mut t = ty.clone();
             ui.menu_button(format!("Data type: {}", ty.label()), |ui| {
@@ -284,6 +311,10 @@ fn node_title(vi: &Vi, n: &Node) -> String {
         NodeKind::Local { target, write, .. } => {
             let name = target.and_then(|t| vi.node(t)).map(|t| t.kind.title()).unwrap_or_else(|| "?".into());
             format!("{name}{}", if *write { " ▸" } else { "" })
+        }
+        NodeKind::Property { target, prop, write } => {
+            let name = target.and_then(|t| vi.node(t)).map(|t| t.kind.title()).unwrap_or_else(|| "?".into());
+            format!("{name}.{}{}", prop.label(), if *write { " ▸" } else { "" })
         }
         k => k.title(),
     }

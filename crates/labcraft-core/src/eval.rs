@@ -1,4 +1,5 @@
 use crate::model::{EventFrame, LoopKind, NodeId, NodeKind, Spec, Vi, Wire, MAX_FRAMES};
+use crate::panel::Prop;
 use crate::ops::{self, BinOp, Cmp, Logic, Unary};
 use crate::typing::{self, TypeMap};
 use crate::types::{ArrayVal, DataType, Value};
@@ -35,6 +36,10 @@ pub struct RunControl {
     pub on_indicator: Box<dyn Fn(NodeId, &Value) + Send + Sync>,
     /// Called when a Local Variable writes to a control, so the panel can show it.
     pub on_control_write: Box<dyn Fn(NodeId, &Value) + Send + Sync>,
+    /// Property values written during this run, so later reads see them.
+    pub properties: Arc<Mutex<HashMap<(NodeId, Prop), Value>>>,
+    /// Called when a Property Node writes, so the panel can apply it.
+    pub on_property: Box<dyn Fn(NodeId, Prop, &Value) + Send + Sync>,
 }
 
 impl RunControl {
@@ -45,6 +50,8 @@ impl RunControl {
             globals: Arc::new(Mutex::new(HashMap::new())),
             on_indicator: Box::new(|_, _| {}),
             on_control_write: Box::new(|_, _| {}),
+            properties: Arc::new(Mutex::new(HashMap::new())),
+            on_property: Box::new(|_, _, _| {}),
         }
     }
 }
@@ -581,6 +588,37 @@ impl<'a> Ctx<'a> {
                     vec![g.get(name).and_then(|v| v.coerce(ty)).unwrap_or_else(|| Value::default_for(ty))]
                 }
             }
+            NodeKind::Decoration { .. } => vec![],
+            NodeKind::Property { target, prop, write } => {
+                let Some(t) = target else { return Ok(if *write { vec![] } else { vec![Value::default_for(&prop.ty())] }) };
+                if *write {
+                    let v = req(0)?.clone();
+                    if let Ok(mut m) = self.ctl.properties.lock() {
+                        m.insert((*t, *prop), v.clone());
+                    }
+                    (self.ctl.on_property)(*t, *prop, &v);
+                    vec![]
+                } else {
+                    let written = self.ctl.properties.lock().ok().and_then(|m| m.get(&(*t, *prop)).cloned());
+                    let tn = self.vi.node(*t);
+                    let v = written.unwrap_or_else(|| match (prop, tn) {
+                        (Prop::Visible, Some(n)) => Value::Bool(n.visible),
+                        (Prop::Disabled, Some(n)) => Value::Bool(n.disabled),
+                        (Prop::Caption, Some(n)) => Value::Str(n.caption.clone().unwrap_or_else(|| n.kind.title())),
+                        _ => Value::default_for(&prop.ty()),
+                    });
+                    vec![v]
+                }
+            }
+            NodeKind::BuildWaveform => {
+                let t0 = opt(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let dt = opt(1).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                vec![Value::Cluster(vec![Value::Dbl(t0), Value::Dbl(dt), req(2)?.clone()])]
+            }
+            NodeKind::GetWaveform => match req(0)? {
+                Value::Cluster(v) if v.len() == 3 => v.clone(),
+                _ => vec![],
+            },
             NodeKind::Add => vec![bin(BinOp::Add)?],
             NodeKind::Subtract => vec![bin(BinOp::Sub)?],
             NodeKind::Multiply => vec![bin(BinOp::Mul)?],

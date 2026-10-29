@@ -105,7 +105,7 @@ fn edit_array(ui: &mut Ui, elem: &DataType, dims: usize, a: &mut ArrayVal, edita
 }
 
 /// Resize dimension `d` of a rectangular array, keeping existing elements where they overlap.
-fn resize_array(a: &mut ArrayVal, elem: &DataType, d: usize, size: usize) {
+pub fn resize_array(a: &mut ArrayVal, elem: &DataType, d: usize, size: usize) {
     let mut new_dims = a.dims.clone();
     new_dims[d] = size;
     let total: usize = new_dims.iter().product();

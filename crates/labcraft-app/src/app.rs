@@ -1,7 +1,7 @@
 use crate::{diagram, panel, theme};
 use eframe::egui::{self, Pos2, RichText};
-use labcraft_core::{run_with, Command, DataType, Editor, Field, LoopKind, NodeId, NodeKind, NumKind, RunControl, RunError, Value, Vi, Widget};
-use std::collections::HashMap;
+use labcraft_core::{chart_default, run_with, Arrange, Command, DataType, DecoKind, Editor, Field, LoopKind, NodeId, NodeKind, NumKind, Prop, RunControl, RunError, Value, Vi, Widget};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,7 @@ pub enum View {
 enum Msg {
     Indicator(NodeId, Value),
     ControlWrite(NodeId, Value),
+    Property(NodeId, Prop, Value),
     Done(Result<(), RunError>),
 }
 
@@ -40,6 +41,10 @@ pub struct LabCraft {
     spawn_count: usize,
     pub editing_const: Option<NodeId>,
     pub wire_menu: Option<((NodeId, usize), Pos2)>,
+    /// Front-panel multi-selection (the primary selection is `selected`).
+    pub panel_sel: BTreeSet<NodeId>,
+    pub panel_band: Option<Pos2>,
+    pub snap_grid: bool,
 }
 
 impl LabCraft {
@@ -59,6 +64,9 @@ impl LabCraft {
             spawn_count: 0,
             editing_const: None,
             wire_menu: None,
+            panel_sel: BTreeSet::new(),
+            panel_band: None,
+            snap_grid: false,
         };
         app.load_example(Example::Loops);
         app
@@ -69,11 +77,16 @@ impl LabCraft {
             Example::Loops => "Loops and Graphs.vi",
             Example::Types => "Arrays and Clusters.vi",
             Example::Structures => "Structures.vi",
+            Example::Panel => "Front Panel Showcase.vi",
         }));
         match ex {
             Example::Loops => demo_loops(&mut ed),
             Example::Types => demo_types(&mut ed),
             Example::Structures => demo_structures(&mut ed),
+            Example::Panel => {
+                demo_panel(&mut ed);
+                self.view = View::FrontPanel;
+            }
         }
         self.ed = ed;
         self.selected = None;
@@ -92,10 +105,15 @@ impl LabCraft {
         if n == 0 { base.into() } else { format!("{base} {}", n + 1) }
     }
 
+    pub fn is_running(&self) -> bool {
+        self.running.is_some()
+    }
+
     fn start_run(&mut self, reset_charts: bool) {
         if reset_charts {
             for n in self.ed.vi.nodes.iter_mut().filter(|n| n.widget == Widget::Chart) {
-                n.value = Some(Value::default_for(&DataType::arr_dbl()));
+                let ty = n.data_type().cloned().unwrap_or(DataType::DBL);
+                n.value = Some(chart_default(&ty));
             }
         }
         let vi = self.ed.vi.clone();
@@ -103,6 +121,7 @@ impl LabCraft {
         let abort = Arc::new(AtomicBool::new(false));
         let txi = tx.clone();
         let txc = tx.clone();
+        let txp = tx.clone();
         // Start every run from the controls' current panel values.
         self.live.lock().unwrap().clear();
         self.live_pushed.clear();
@@ -115,6 +134,10 @@ impl LabCraft {
             }),
             on_control_write: Box::new(move |id, v| {
                 let _ = txc.send(Msg::ControlWrite(id, v.clone()));
+            }),
+            properties: Arc::new(Mutex::new(HashMap::new())),
+            on_property: Box::new(move |id, p, v| {
+                let _ = txp.send(Msg::Property(id, p, v.clone()));
             }),
         };
         std::thread::spawn(move || {
@@ -146,7 +169,30 @@ impl LabCraft {
                                 }
                                 h.dims = vec![h.data.len()];
                             }
+                            (Widget::Chart, Value::Cluster(row), Some(Value::Array(h))) => {
+                                let cols = row.len();
+                                if h.dims.len() != 2 || h.dims[1] != cols {
+                                    h.dims = vec![0, cols];
+                                    h.data.clear();
+                                }
+                                h.data.extend(row.iter().map(|x| Value::Dbl(x.as_f64().unwrap_or(0.0))));
+                                h.dims[0] += 1;
+                                if h.dims[0] > CHART_HISTORY {
+                                    h.data.drain(0..cols);
+                                    h.dims[0] -= 1;
+                                }
+                            }
                             _ => n.value = Some(v),
+                        }
+                    }
+                }
+                Msg::Property(id, prop, v) => {
+                    if let Some(n) = self.ed.vi.node_mut(id) {
+                        match (prop, v) {
+                            (Prop::Visible, Value::Bool(b)) => n.visible = b,
+                            (Prop::Disabled, Value::Bool(b)) => n.disabled = b,
+                            (Prop::Caption, Value::Str(s)) => n.caption = Some(s),
+                            _ => {}
                         }
                     }
                 }
@@ -221,8 +267,13 @@ impl LabCraft {
                     Self::section(ui, title, theme::type_color(&ty), |ui| {
                         for it in items {
                             if Self::item(ui, it.label) {
-                                let name = self.name_for(it.name);
-                                let kind = if it.ctl { NodeKind::Control { name, ty: it.ty } } else { NodeKind::Indicator { name, ty: it.ty } };
+                                let kind = if let Some(deco) = it.deco {
+                                    let text = if deco == DecoKind::Label { "Label".to_string() } else { String::new() };
+                                    NodeKind::Decoration { deco, text, color: [110, 130, 190] }
+                                } else {
+                                    let name = self.name_for(it.name);
+                                    if it.ctl { NodeKind::Control { name, ty: it.ty } } else { NodeKind::Indicator { name, ty: it.ty } }
+                                };
                                 self.spawn(kind, Some(it.widget));
                             }
                         }
@@ -248,6 +299,7 @@ pub enum Example {
     Loops,
     Types,
     Structures,
+    Panel,
 }
 
 struct PanelItem {
@@ -256,10 +308,23 @@ struct PanelItem {
     ty: DataType,
     ctl: bool,
     widget: Widget,
+    deco: Option<DecoKind>,
 }
 
 fn pi(label: &'static str, name: &'static str, ty: DataType, ctl: bool, widget: Widget) -> PanelItem {
-    PanelItem { label, name, ty, ctl, widget }
+    PanelItem { label, name, ty, ctl, widget, deco: None }
+}
+
+fn deco_item(label: &'static str, kind: DecoKind) -> PanelItem {
+    PanelItem { label, name: label, ty: DataType::DBL, ctl: false, widget: Widget::Decoration, deco: Some(kind) }
+}
+
+fn xy_type() -> DataType {
+    DataType::Cluster(vec![Field { name: "x".into(), ty: DataType::arr_dbl() }, Field { name: "y".into(), ty: DataType::arr_dbl() }])
+}
+
+fn multi_chart_type() -> DataType {
+    DataType::Cluster(vec![Field { name: "a".into(), ty: DataType::DBL }, Field { name: "b".into(), ty: DataType::DBL }])
 }
 
 fn sensor_type() -> DataType {
@@ -307,6 +372,9 @@ fn panel_palette() -> Vec<(&'static str, DataType, Vec<PanelItem>)> {
             pi("2D Numeric Array Indicator", "2D Array Indicator", DataType::array(DataType::DBL, 2), false, ArrayInd),
             pi("Boolean Array Control", "Boolean Array", DataType::array(DataType::Bool, 1), true, ArrayCtl),
             pi("String Array Control", "String Array", DataType::array(DataType::Str, 1), true, ArrayCtl),
+            pi("Table (strings)", "Table", DataType::array(DataType::Str, 2), true, Table),
+            pi("Table Indicator (numeric)", "Table Indicator", DataType::array(DataType::DBL, 2), false, Table),
+            pi("Listbox", "Listbox", DataType::array(DataType::Str, 1), true, ListBox),
         ]),
         ("Cluster", DataType::Cluster(vec![]), vec![
             pi("Cluster Control", "Cluster", sensor_type(), true, ClusterCtl),
@@ -316,7 +384,17 @@ fn panel_palette() -> Vec<(&'static str, DataType, Vec<PanelItem>)> {
         ]),
         ("Graph", DataType::arr_dbl(), vec![
             pi("Waveform Chart", "Waveform Chart", d(), false, Chart),
+            pi("Multi-plot Chart", "Multi-plot Chart", multi_chart_type(), false, Chart),
             pi("Waveform Graph", "Waveform Graph", DataType::arr_dbl(), false, Graph),
+            pi("Waveform Graph (waveform data)", "Waveform", DataType::waveform(), false, Graph),
+            pi("Multi-plot Graph (2D array)", "Multi-plot Graph", DataType::array(DataType::DBL, 2), false, Graph),
+            pi("XY Graph", "XY Graph", xy_type(), false, XyGraph),
+            pi("Intensity Graph", "Intensity Graph", DataType::array(DataType::DBL, 2), false, IntensityGraph),
+        ]),
+        ("Decorations", DataType::Cluster(vec![]), vec![
+            deco_item("Box", DecoKind::Box),
+            deco_item("Line", DecoKind::Line),
+            deco_item("Free Label", DecoKind::Label),
         ]),
     ]
 }
@@ -337,6 +415,12 @@ fn diagram_palette() -> Vec<(&'static str, DataType, Vec<(String, NodeKind)>)> {
             l("Local Variable", NodeKind::Local { target: None, ty: DataType::DBL, write: false }),
             l("Global Variable", NodeKind::Global { name: "Global 1".into(), ty: DataType::DBL, write: false }),
             l("Feedback Node", NodeKind::Feedback { ty: DataType::DBL }),
+            l("Property Node (read)", NodeKind::Property { target: None, prop: Prop::Visible, write: false }),
+            l("Property Node (write)", NodeKind::Property { target: None, prop: Prop::Visible, write: true }),
+        ]),
+        ("Waveform", DataType::waveform(), vec![
+            l("Build Waveform", NodeKind::BuildWaveform),
+            l("Get Waveform Components", NodeKind::GetWaveform),
         ]),
         ("Numeric", DataType::DBL, vec![
             l("Add", NodeKind::Add), l("Subtract", NodeKind::Subtract), l("Multiply", NodeKind::Multiply), l("Divide", NodeKind::Divide),
@@ -438,6 +522,153 @@ fn demo_loops(ed: &mut Editor) {
         ed.apply(Command::SetRange { id, range }).unwrap();
     }
     set(ed, amp, Value::Dbl(5.0));
+}
+
+/// M7 demo: graphs of every kind, tables, decorations, layout and a Property Node.
+fn demo_panel(ed: &mut Editor) {
+    let ctl = |name: &str, ty| NodeKind::Control { name: name.into(), ty };
+    let ind = |name: &str, ty| NodeKind::Indicator { name: name.into(), ty };
+    let place = |ed: &mut Editor, id: NodeId, pos: [f32; 2], size: Option<[f32; 2]>| {
+        ed.apply(Command::MovePanelItem { id, pos }).unwrap();
+        if let Some(size) = size {
+            ed.apply(Command::ResizePanelItem { id, size }).unwrap();
+        }
+        ed.apply(Command::EndGesture).unwrap();
+    };
+    let mul = |ed: &mut Editor, a: (NodeId, usize), b: (NodeId, usize), pos: [f32; 2]| {
+        let m = add(ed, NodeKind::Multiply, pos, None);
+        wire(ed, a, (m, 0));
+        wire(ed, b, (m, 1));
+        m
+    };
+
+    // --- For loop (N = 100): sin(t) and cos(t) gathered by auto-indexing ---
+    let n = konst(ed, DataType::I32, Value::Int(100), [20.0, 20.0]);
+    let fl = add(ed, NodeKind::Loop { kind: LoopKind::For, regs: vec![] }, [170.0, 20.0], None);
+    ed.apply(Command::Resize { id: fl, size: [520.0, 190.0] }).unwrap();
+    wire(ed, (n, 0), (fl, 0));
+    let step = konst(ed, DataType::DBL, Value::Dbl(0.1), [200.0, 60.0]);
+    let t = mul(ed, (fl, 0), (step, 0), [330.0, 60.0]);
+    let sin = add(ed, NodeKind::Sine, [470.0, 50.0], None);
+    wire(ed, (t, 0), (sin, 0));
+    let quarter = konst(ed, DataType::DBL, Value::Dbl(1.5708), [200.0, 130.0]);
+    let shifted = add(ed, NodeKind::Add, [330.0, 130.0], None);
+    wire(ed, (t, 0), (shifted, 0));
+    wire(ed, (quarter, 0), (shifted, 1));
+    let cos = add(ed, NodeKind::Sine, [470.0, 120.0], None);
+    wire(ed, (shifted, 0), (cos, 0));
+
+    // waveform graph (t0 = 0, dt = 0.1)
+    let dt = konst(ed, DataType::DBL, Value::Dbl(0.1), [20.0, 120.0]);
+    let wf = add(ed, NodeKind::BuildWaveform, [720.0, 60.0], None);
+    wire(ed, (sin, 0), (wf, 2));
+    wire(ed, (dt, 0), (wf, 1));
+    let waveform = add(ed, ind("Waveform Graph", DataType::waveform()), [880.0, 60.0], Some(Widget::Graph));
+    wire(ed, (wf, 0), (waveform, 0));
+    // multi-plot graph: rows are plots
+    let r1 = add(ed, NodeKind::BuildArray, [720.0, 130.0], None);
+    wire(ed, (sin, 0), (r1, 1));
+    let r2 = add(ed, NodeKind::BuildArray, [880.0, 130.0], None);
+    wire(ed, (r1, 0), (r2, 0));
+    wire(ed, (cos, 0), (r2, 1));
+    let multi = add(ed, ind("Multi-plot Graph", DataType::array(DataType::DBL, 2)), [1030.0, 130.0], Some(Widget::Graph));
+    wire(ed, (r2, 0), (multi, 0));
+    let table_ind = add(ed, ind("Samples", DataType::array(DataType::DBL, 2)), [1030.0, 200.0], Some(Widget::Table));
+    wire(ed, (r2, 0), (table_ind, 0));
+    // XY graph: sin vs cos is a circle
+    let xy = add(ed, NodeKind::Bundle { n: 2 }, [720.0, 200.0], None);
+    wire(ed, (cos, 0), (xy, 1));
+    wire(ed, (sin, 0), (xy, 2));
+    let xy_ind = add(ed, ind("XY Graph", xy_type()), [880.0, 220.0], Some(Widget::XyGraph));
+    wire(ed, (xy, 0), (xy_ind, 0));
+
+    // --- Intensity graph: nested For loops compute sin(i * 0.2) * cos(j * 0.15) ---
+    let rows = konst(ed, DataType::I32, Value::Int(40), [20.0, 260.0]);
+    let outer = add(ed, NodeKind::Loop { kind: LoopKind::For, regs: vec![] }, [170.0, 260.0], None);
+    ed.apply(Command::Resize { id: outer, size: [620.0, 330.0] }).unwrap();
+    wire(ed, (rows, 0), (outer, 0));
+    let inner = add(ed, NodeKind::Loop { kind: LoopKind::For, regs: vec![] }, [380.0, 300.0], None);
+    ed.apply(Command::Resize { id: inner, size: [390.0, 250.0] }).unwrap();
+    ed.apply(Command::Drop(inner)).unwrap();
+    let cols = konst(ed, DataType::I32, Value::Int(60), [200.0, 330.0]);
+    wire(ed, (cols, 0), (inner, 0));
+    let ki = konst(ed, DataType::DBL, Value::Dbl(0.2), [200.0, 400.0]);
+    let mi = mul(ed, (outer, 0), (ki, 0), [200.0, 470.0]);
+    let si = add(ed, NodeKind::Sine, [330.0, 470.0], None);
+    wire(ed, (mi, 0), (si, 0));
+    let kj = konst(ed, DataType::DBL, Value::Dbl(0.15), [410.0, 340.0]);
+    let mj = mul(ed, (inner, 0), (kj, 0), [550.0, 340.0]);
+    let off = konst(ed, DataType::DBL, Value::Dbl(1.5708), [410.0, 420.0]);
+    let cj = add(ed, NodeKind::Add, [550.0, 420.0], None);
+    wire(ed, (mj, 0), (cj, 0));
+    wire(ed, (off, 0), (cj, 1));
+    let cosj = add(ed, NodeKind::Sine, [640.0, 380.0], None);
+    wire(ed, (cj, 0), (cosj, 0));
+    let prod = mul(ed, (si, 0), (cosj, 0), [640.0, 470.0]);
+    let heat = add(ed, ind("Heat Map", DataType::array(DataType::DBL, 2)), [820.0, 380.0], Some(Widget::IntensityGraph));
+    wire(ed, (prod, 0), (heat, 0));
+
+    // --- Multi-plot chart streams two signals until Stop ---
+    let stop = add(ed, ctl("Stop", DataType::Bool), [20.0, 620.0], Some(Widget::PushButton));
+    let wl = add(ed, NodeKind::Loop { kind: LoopKind::While, regs: vec![] }, [170.0, 620.0], None);
+    ed.apply(Command::Resize { id: wl, size: [560.0, 170.0] }).unwrap();
+    wire(ed, (stop, 0), (wl, 0));
+    let c1 = konst(ed, DataType::DBL, Value::Dbl(0.2), [200.0, 650.0]);
+    let c2 = konst(ed, DataType::DBL, Value::Dbl(0.37), [200.0, 720.0]);
+    let a1 = mul(ed, (wl, 0), (c1, 0), [330.0, 650.0]);
+    let a2 = mul(ed, (wl, 0), (c2, 0), [330.0, 720.0]);
+    let s1 = add(ed, NodeKind::Sine, [450.0, 650.0], None);
+    let s2 = add(ed, NodeKind::Sine, [450.0, 720.0], None);
+    wire(ed, (a1, 0), (s1, 0));
+    wire(ed, (a2, 0), (s2, 0));
+    let pair = add(ed, NodeKind::Bundle { n: 2 }, [560.0, 670.0], None);
+    wire(ed, (s1, 0), (pair, 1));
+    wire(ed, (s2, 0), (pair, 2));
+    let ms = konst(ed, DataType::I32, Value::Int(40), [560.0, 740.0]);
+    let wait = add(ed, NodeKind::WaitMs, [680.0, 740.0], None);
+    wire(ed, (ms, 0), (wait, 0));
+    let chart = add(ed, ind("Multi-plot Chart", multi_chart_type()), [820.0, 640.0], Some(Widget::Chart));
+    wire(ed, (pair, 0), (chart, 0));
+
+    // --- Table, listbox, and a Property Node driven by a toggle ---
+    let table = add(ed, ctl("Table", DataType::array(DataType::Str, 2)), [20.0, 800.0], Some(Widget::Table));
+    let cells = ["name", "unit", "volts", "V", "amps", "A"];
+    set(ed, table, Value::Array(labcraft_core::ArrayVal { dims: vec![3, 2], data: cells.iter().map(|c| Value::Str(c.to_string())).collect() }));
+    let list = add(ed, ctl("Listbox", DataType::array(DataType::Str, 1)), [20.0, 820.0], Some(Widget::ListBox));
+    set(ed, list, Value::array1(["alpha", "beta", "gamma", "delta"].iter().map(|c| Value::Str(c.to_string())).collect()));
+    let show = add(ed, ctl("Show Details", DataType::Bool), [20.0, 840.0], None);
+    set(ed, show, Value::Bool(true));
+    let details = add(ed, ind("Details", DataType::DBL), [20.0, 860.0], None);
+    let prop = add(ed, NodeKind::Property { target: Some(details), prop: Prop::Visible, write: true }, [900.0, 860.0], None);
+    wire(ed, (show, 0), (prop, 0));
+    let note = add(ed, NodeKind::Decoration { deco: DecoKind::Label, text: "Front Panel Showcase — right-click anything".into(), color: [150, 200, 255] }, [0.0, 0.0], None);
+    let boxed = add(ed, NodeKind::Decoration { deco: DecoKind::Box, text: "Settings".into(), color: [110, 130, 190] }, [0.0, 0.0], None);
+    let rule = add(ed, NodeKind::Decoration { deco: DecoKind::Line, text: String::new(), color: [110, 130, 190] }, [0.0, 0.0], None);
+
+    // Panel layout: three columns.
+    place(ed, note, [20.0, 8.0], Some([420.0, 26.0]));
+    place(ed, waveform, [20.0, 50.0], Some([340.0, 190.0]));
+    place(ed, multi, [20.0, 260.0], Some([340.0, 190.0]));
+    place(ed, xy_ind, [20.0, 470.0], Some([340.0, 230.0]));
+    place(ed, heat, [380.0, 50.0], Some([330.0, 240.0]));
+    place(ed, chart, [380.0, 310.0], Some([330.0, 200.0]));
+    place(ed, table_ind, [380.0, 530.0], Some([330.0, 170.0]));
+    place(ed, boxed, [730.0, 40.0], Some([320.0, 560.0]));
+    place(ed, table, [745.0, 70.0], Some([290.0, 160.0]));
+    place(ed, rule, [745.0, 240.0], Some([290.0, 10.0]));
+    place(ed, list, [745.0, 262.0], Some([200.0, 150.0]));
+    place(ed, show, [745.0, 440.0], None);
+    place(ed, details, [745.0, 520.0], None);
+    place(ed, stop, [900.0, 440.0], None);
+    // keep the box behind everything it groups
+    ed.apply(Command::ArrangePanel { ids: vec![boxed], op: Arrange::SendToBack }).unwrap();
+    for (id, name) in [(waveform, "Waveform Graph"), (multi, "Multi-plot Graph")] {
+        let mut cfg = ed.vi.node(id).unwrap().graph.clone();
+        cfg.x_label = if name.starts_with("Wave") { "time (s)".into() } else { "sample".into() };
+        cfg.plot_names = vec!["sin".into(), "cos".into()];
+        cfg.cursors = vec![if name.starts_with("Wave") { 2.5 } else { 40.0 }];
+        ed.apply(Command::SetGraphConfig { id, cfg }).unwrap();
+    }
 }
 
 /// M4 demo: Case structure selected by an enum, auto-indexing, a Feedback Node, and an Event
@@ -644,6 +875,29 @@ impl eframe::App for LabCraft {
                 if ui.button("↷ Redo").clicked() {
                     let _ = self.ed.redo();
                 }
+                if self.view == View::FrontPanel {
+                    ui.separator();
+                    let sel: Vec<NodeId> = self.panel_sel.iter().copied().collect();
+                    ui.menu_button("Arrange", |ui| {
+                        let groups: [(&str, Vec<(&str, Arrange, usize)>); 3] = [
+                            ("Align", vec![("Left", Arrange::AlignLeft, 2), ("Right", Arrange::AlignRight, 2), ("Top", Arrange::AlignTop, 2), ("Bottom", Arrange::AlignBottom, 2), ("Center horizontally", Arrange::CenterHorizontally, 2), ("Center vertically", Arrange::CenterVertically, 2)]),
+                            ("Distribute / size", vec![("Distribute horizontally", Arrange::DistributeHorizontally, 3), ("Distribute vertically", Arrange::DistributeVertically, 3), ("Same width", Arrange::SameWidth, 2), ("Same height", Arrange::SameHeight, 2)]),
+                            ("Order", vec![("Bring to front", Arrange::BringToFront, 1), ("Send to back", Arrange::SendToBack, 1)]),
+                        ];
+                        for (title, ops) in groups {
+                            ui.label(RichText::new(title).small().color(theme::TEXT_DIM));
+                            for (label, op, need) in ops {
+                                if ui.add_enabled(sel.len() >= need, egui::Button::new(label)).clicked() {
+                                    self.pending.push(Command::ArrangePanel { ids: sel.clone(), op });
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                        }
+                        ui.label(RichText::new(format!("{} selected (Shift/Cmd-click or drag a box)", sel.len())).small().color(theme::TEXT_DIM));
+                    });
+                    ui.checkbox(&mut self.snap_grid, "Snap");
+                }
                 ui.separator();
                 if ui.button("Save").clicked() {
                     let path = format!("{}.json", self.ed.vi.name);
@@ -663,6 +917,10 @@ impl eframe::App for LabCraft {
                     }
                     if ui.button("Structures").clicked() {
                         self.load_example(Example::Structures);
+                        ui.close();
+                    }
+                    if ui.button("Front Panel Showcase").clicked() {
+                        self.load_example(Example::Panel);
                         ui.close();
                     }
                 });
@@ -742,6 +1000,28 @@ mod tests {
     }
 
     #[test]
+    fn panel_demo_runs_headless_and_produces_every_graph_type() {
+        let mut ed = Editor::new(Vi::new("t"));
+        demo_panel(&mut ed);
+        let stop = find(&ed, "Stop");
+        set(&mut ed, stop, Value::Bool(true));
+        let res = labcraft_core::run(&ed.vi).unwrap();
+        let get = |t: &str| res.indicators.iter().find(|(id, _)| *id == find(&ed, t)).unwrap().1.clone();
+        let Value::Cluster(wf) = get("Waveform Graph") else { panic!() };
+        assert_eq!((wf[0].as_f64(), wf[1].as_f64()), (Some(0.0), Some(0.1)));
+        assert_eq!(wf[2].to_f64_vec().len(), 100);
+        let Value::Array(m) = get("Multi-plot Graph") else { panic!() };
+        assert_eq!(m.dims, vec![2, 100]);
+        let Value::Cluster(xy) = get("XY Graph") else { panic!() };
+        assert_eq!(xy[0].to_f64_vec().len(), 100);
+        let Value::Array(h) = get("Heat Map") else { panic!() };
+        assert_eq!(h.dims, vec![40, 60]);
+        // Show Details = true leaves the indicator visible; the property node wrote it
+        assert!(ed.vi.node(find(&ed, "Details")).unwrap().visible);
+        assert!(ed.vi.nodes.iter().any(|n| n.kind.is_decoration()));
+    }
+
+    #[test]
     fn structures_demo_runs_headless() {
         let mut ed = Editor::new(Vi::new("t"));
         demo_structures(&mut ed);
@@ -766,6 +1046,10 @@ mod tests {
         }
         for (_, _, items) in panel_palette() {
             for it in items {
+                if let Some(deco) = it.deco {
+                    add(&mut ed, NodeKind::Decoration { deco, text: String::new(), color: [1, 2, 3] }, [0.0, 0.0], Some(it.widget));
+                    continue;
+                }
                 let kind = if it.ctl { NodeKind::Control { name: it.name.into(), ty: it.ty.clone() } } else { NodeKind::Indicator { name: it.name.into(), ty: it.ty.clone() } };
                 assert!(it.widget.fits(&it.ty, it.ctl), "{} does not fit", it.label);
                 add(&mut ed, kind, [0.0, 0.0], Some(it.widget));
@@ -775,7 +1059,7 @@ mod tests {
 
     #[test]
     fn examples_render_in_both_views_without_panicking() {
-        for ex in [Example::Loops, Example::Types, Example::Structures] {
+        for ex in [Example::Loops, Example::Types, Example::Structures, Example::Panel] {
             for view in [View::FrontPanel, View::BlockDiagram] {
                 let mut app = LabCraft::new();
                 app.load_example(ex);
@@ -802,5 +1086,65 @@ mod tests {
                 assert!(app.status != "never");
             }
         }
+    }
+
+    #[test]
+    fn examples_render_with_real_data_in_every_widget() {
+        for ex in [Example::Loops, Example::Types, Example::Structures, Example::Panel] {
+            let mut app = LabCraft::new();
+            app.load_example(ex);
+            if let Some(stop) = app.ed.vi.nodes.iter().find(|n| n.kind.title() == "Stop").map(|n| n.id) {
+                set(&mut app.ed, stop, Value::Bool(true));
+            }
+            let res = labcraft_core::run(&app.ed.vi).unwrap();
+            for (id, v) in res.indicators {
+                if let Some(n) = app.ed.vi.node_mut(id) {
+                    n.value = Some(v);
+                }
+            }
+            for view in [View::FrontPanel, View::BlockDiagram] {
+                app.view = view;
+                let ctx = egui::Context::default();
+                crate::theme::apply(&ctx);
+                for _ in 0..2 {
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1000.0))),
+                        ..Default::default()
+                    };
+                    let mut out = ctx.run_ui(input, |ui| match view {
+                        View::FrontPanel => crate::panel::show(&mut app, ui),
+                        View::BlockDiagram => crate::diagram::show(&mut app, ui),
+                    });
+                    out.textures_delta.clear();
+                    app.flush();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multi_plot_chart_history_and_property_messages() {
+        let mut app = LabCraft::new();
+        app.ed = Editor::new(Vi::new("t"));
+        let ty = multi_chart_type();
+        let chart = add(&mut app.ed, NodeKind::Indicator { name: "c".into(), ty }, [0.0, 0.0], Some(Widget::Chart));
+        let item = add(&mut app.ed, NodeKind::Control { name: "x".into(), ty: DataType::DBL }, [0.0, 0.0], None);
+        let (tx, rx) = channel();
+        app.running = Some(Running { rx, abort: Arc::new(AtomicBool::new(false)) });
+        for i in 0..3 {
+            tx.send(Msg::Indicator(chart, Value::Cluster(vec![Value::Dbl(i as f64), Value::Dbl(10.0 * i as f64)]))).unwrap();
+        }
+        tx.send(Msg::Property(item, Prop::Visible, Value::Bool(false))).unwrap();
+        tx.send(Msg::Property(item, Prop::Caption, Value::Str("Speed".into()))).unwrap();
+        app.pump();
+        let Some(Value::Array(h)) = &app.ed.vi.node(chart).unwrap().value else { panic!() };
+        assert_eq!(h.dims, vec![3, 2]);
+        assert_eq!(h.data[5], Value::Dbl(20.0));
+        let n = app.ed.vi.node(item).unwrap();
+        assert!(!n.visible && n.caption.as_deref() == Some("Speed"));
+        // the chart splits the history into one series per column
+        let series = crate::graph::series_for(Widget::Chart, &multi_chart_type(), &Value::Array(h.clone()));
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[1].ys, vec![0.0, 10.0, 20.0]);
     }
 }
